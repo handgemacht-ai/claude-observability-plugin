@@ -195,14 +195,6 @@ npx @langfuse/cli api observations list \
 Add `--trace-id` when checking one turn. Search the dashboard for
 `Claude Code Turn` if you prefer the UI.
 
-The old traces-list recipe is only for self-hosted Langfuse v3, where you must
-pin the CLI contract:
-
-```bash
-npx @langfuse/cli --api-version 3 api traces list \
-  --from-timestamp <iso> --limit 10 --order-by timestamp.desc --fields core,metrics,observations --json
-```
-
 ### Desktop app (GUI) sessions
 
 A GUI app does not read your shell profile and resolves `PATH` once at launch, so
