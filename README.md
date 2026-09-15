@@ -176,10 +176,32 @@ the newest lines against this table:
 | `langfuse import failed (…) python=… PATH=…` | The Python that ran the hook cannot import the SDK. The line names the interpreter and PATH. Install uv on that PATH, or make `python3` a 3.10+ environment with `langfuse>=4.7,<5`. |
 | `Langfuse config incomplete: missing …` | The named keys did not reach the hook. Configure them with `/plugin configure`. If the line also says `loaded under plugin identity '@inline'`, see below. |
 | `Hook started` plus a skip reason | The hook ran and skipped on purpose, which is usual for background sessions. Report it with the log line if real turns are missing. |
-| `Processed N turns …` but nothing in Langfuse | Delivery failed after the SDK took the turns. Check `LANGFUSE_BASE_URL` (EU against US), key validity, and proxy reachability. |
+| `Processed N turns …` but nothing in Langfuse | Delivery failed after the SDK took the turns. Check `LANGFUSE_BASE_URL` (EU against US), key validity, and proxy reachability. Confirm with [Verifying in Langfuse](#verifying-in-langfuse). |
 
 `Hook started` and other `[DEBUG]` lines need `CC_LANGFUSE_DEBUG`. The failure
 lines above are `[INFO]` and appear without it.
+
+### Verifying in Langfuse
+
+Confirm the turn landed with bounded Observations API v2
+(`GET /api/public/v2/observations`), not GET `/api/public/traces`. Use
+credentials for the same project:
+
+```bash
+npx @langfuse/cli api observations list \
+  --from-start-time <iso> --limit 10 --json
+```
+
+Add `--trace-id` when checking one turn. Search the dashboard for
+`Claude Code Turn` if you prefer the UI.
+
+The old traces-list recipe is only for self-hosted Langfuse v3, where you must
+pin the CLI contract:
+
+```bash
+npx @langfuse/cli --api-version 3 api traces list \
+  --from-timestamp <iso> --limit 10 --order-by timestamp.desc --fields core,metrics,observations --json
+```
 
 ### Desktop app (GUI) sessions
 
