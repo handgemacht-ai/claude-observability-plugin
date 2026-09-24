@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 
 # ----------------- Configuration -----------------
@@ -40,6 +40,8 @@ DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+CAPTURE_INSTRUCTIONS = (_opt("CC_LANGFUSE_CAPTURE_INSTRUCTIONS") or "true").lower() == "true"
+CAPTURE_SYSTEM_PROMPT = (_opt("CC_LANGFUSE_CAPTURE_SYSTEM_PROMPT") or "true").lower() == "true"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
@@ -52,6 +54,8 @@ MAX_OPERATOR_TAG_CHARS = 200
 # Bound for unresolved task notifications kept in the state file between runs.
 MAX_PENDING_TASK_NOTIFICATIONS = 50
 INTERRUPTED_TURN_MARKER = "[Request interrupted by user]"
+# Claude Code caps spawn depth far lower; this only bounds corrupt data.
+MAX_AGENT_DEPTH = 32
 
 def parse_operator_tags(raw: str) -> Tuple[List[str], str]:
     """Parse caller tags from a JSON array or a comma-separated list.
@@ -151,6 +155,8 @@ STATE_DIR, _STATE_DIR_WARNING = _resolve_state_dir()
 LOG_FILE = STATE_DIR / "langfuse_hook.log"
 STATE_FILE = STATE_DIR / "langfuse_state.json"
 LOCK_FILE = STATE_DIR / "langfuse_state.lock"
+# Written by hooks/langfuse_context_hook.py (InstructionsLoaded, SessionStart).
+CONTEXT_DIR_NAME = "langfuse_context"
 
 
 @dataclass
@@ -444,6 +450,14 @@ def get_session_id_and_transcript_path(payload: Dict[str, Any]) -> Optional[Tupl
 
     return session_id, transcript_path
 
+def get_main_agent_type_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    """The main agent's name (--agent or the "agent" setting). A payload that
+    carries agent_id comes from inside a subagent, whose type is not it."""
+    agent_type = payload.get("agent_type")
+    if payload.get("agent_id") or not isinstance(agent_type, str) or not agent_type:
+        return None
+    return agent_type
+
 def is_session_end_hook_payload(payload: Dict[str, Any]) -> bool:
     hook_event_name = payload.get("hook_event_name") or payload.get("hookEventName")
     return hook_event_name == "SessionEnd"
@@ -537,6 +551,9 @@ class SessionState:
     # partially emitted turn across firings and across the open -> closed ->
     # deferred transitions; entries are dropped once the turn is finalized.
     turn_progress: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Name of the agent the main conversation runs as (--agent / "agent"
+    # setting); last known value, used when a firing cannot see it.
+    main_agent: str = ""
 
 def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
@@ -555,6 +572,9 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     turn_progress = s.get("turn_progress")
     if not isinstance(turn_progress, dict):
         turn_progress = {}
+    main_agent = s.get("main_agent")
+    if not isinstance(main_agent, str):
+        main_agent = ""
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
@@ -564,6 +584,7 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
         open_turn=open_turn,
         turn_numbers=turn_numbers,
         turn_progress=turn_progress,
+        main_agent=main_agent,
     )
 
 def update_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
@@ -576,6 +597,7 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "open_turn": session_state.open_turn or {},
         "turn_numbers": session_state.turn_numbers or {},
         "turn_progress": session_state.turn_progress or {},
+        "main_agent": session_state.main_agent or "",
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1107,7 +1129,18 @@ def get_async_launch_flag_from_row(row: Dict[str, Any]) -> Optional[bool]:
     # A teammate launch is async too: its result never carries the final output.
     if tool_use_result.get("status") in ("async_launched", "teammate_spawned"):
         return True
+    # A SendMessage that resumes a stopped agent runs it in the background;
+    # its result arrives as a task notification naming the SendMessage call.
+    if get_resumed_agent_id_from_row(row):
+        return True
     return tool_use_result.get("isAsync") is True
+
+def get_resumed_agent_id_from_row(row: Dict[str, Any]) -> Optional[str]:
+    tool_use_result = row.get("toolUseResult") if isinstance(row, dict) else None
+    if not isinstance(tool_use_result, dict):
+        return None
+    agent_id = tool_use_result.get("resumedAgentId")
+    return agent_id if isinstance(agent_id, str) and agent_id else None
 
 def get_workflow_launch_marker_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Read the structured Workflow launch marker from a tool_result row.
@@ -1153,8 +1186,9 @@ def get_pending_agent_tool_use_ids(turn: Turn) -> List[str]:
     tool_use_ids: List[str] = []
     for assistant_message in turn.assistant_msgs:
         for tool_use_block in get_tool_use_blocks(get_content_from_row(assistant_message)):
-            # Workflows resolve via task notifications too, so they hold the turn open.
-            if tool_use_block.get("name") not in ("Agent", "Task", "Workflow"):
+            # Workflows and agent resumes (SendMessage) resolve via task
+            # notifications too, so they hold the turn open.
+            if tool_use_block.get("name") not in ("Agent", "Task", "Workflow", "SendMessage"):
                 continue
             tool_use_id = str(tool_use_block.get("id") or "")
             if not tool_use_id:
@@ -1236,6 +1270,11 @@ def add_injected_context_row(row: Dict[str, Any], state: TurnAssemblyState) -> b
     # carry isMeta=true. They are not real prompts, so they must not start turns.
     if not row.get("isMeta"):
         return False
+    # Inside agent transcripts, results of the agent's own background
+    # children arrive as isMeta rows; they belong to the notification path.
+    origin = row.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") == "task-notification":
+        return False
 
     # Skill invocations link their injected instructions to the originating
     # tool_use via sourceToolUseID; keep the text so emit can optionally attach
@@ -1264,6 +1303,7 @@ def add_tool_result_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
     row_timestamp = row.get("timestamp")
     is_async_launch = get_async_launch_flag_from_row(row)
     workflow_launch_marker = get_workflow_launch_marker_from_row(row)
+    resumed_agent_id = get_resumed_agent_id_from_row(row)
     for tool_result_block in get_tool_result_blocks(get_content_from_row(row)):
         tool_use_id = tool_result_block.get("tool_use_id")
         if tool_use_id:
@@ -1275,6 +1315,8 @@ def add_tool_result_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
                 tool_result_entry["is_error"] = tool_result_block["is_error"]
             if is_async_launch is not None:
                 tool_result_entry["is_async_launch"] = is_async_launch
+            if resumed_agent_id:
+                tool_result_entry["resumed_agent_id"] = resumed_agent_id
             if workflow_launch_marker is not None:
                 # Links the launching tool_use to its workflow run so emission
                 # can attach the run's agent transcripts (which have no
@@ -1708,12 +1750,25 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
             info(f"multiple subagent metas claim tool_use {tool_use_id}, skipping: {meta_path}")
             continue
 
-        subagent_transcripts_by_tool_use_id[tool_use_id] = {
+        subagent_entry: Dict[str, Any] = {
             "path": jsonl_path,
             "agent_id": agent_id,
             "agent_type": metadata.get("agentType"),
             "description": metadata.get("description"),
+            "tool_use_id": tool_use_id,
         }
+        # Every depth lives flat in this directory; spawnDepth and
+        # parentAgentId (depth >= 2 only) record where it hangs in the tree.
+        for meta_key, entry_key in (
+            ("spawnDepth", "spawn_depth"),
+            ("parentAgentId", "parent_agent_id"),
+            ("model", "model"),
+            ("name", "name"),
+        ):
+            value = metadata.get(meta_key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool) and value != "":
+                subagent_entry[entry_key] = value
+        subagent_transcripts_by_tool_use_id[tool_use_id] = subagent_entry
     return subagent_transcripts_by_tool_use_id
 
 def get_workflow_journal_results(run_dir: Path) -> Dict[str, Any]:
@@ -1821,10 +1876,731 @@ def get_task_id_to_tool_use_id(
         return task_id_to_tool_use_id
 
     for tool_use_id, subagent in subagent_transcripts_by_tool_use_id.items():
+        if not isinstance(subagent, dict) or is_resumed_run_entry(subagent):
+            continue
         agent_id = subagent.get("agent_id")
         if isinstance(agent_id, str) and agent_id:
             task_id_to_tool_use_id[agent_id] = tool_use_id
     return task_id_to_tool_use_id
+
+
+# ----------------- Resumed agents -----------------
+def _as_aware(timestamp: datetime) -> datetime:
+    return timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=timezone.utc)
+
+def is_resumed_run_entry(subagent: Any) -> bool:
+    return isinstance(subagent, dict) and isinstance(subagent.get("resume_start"), datetime)
+
+def get_agent_resumes_from_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """SendMessage calls in the rows that resumed a stopped agent.
+
+    A resumed agent appends to its own transcript. Only the SendMessage
+    tool_result (toolUseResult.resumedAgentId) ties that later work to the call.
+    """
+    send_message_timestamps: Dict[str, Any] = {}
+    resumes: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for tool_use in get_tool_use_blocks(get_content_from_row(row)):
+            if tool_use.get("name") == "SendMessage" and tool_use.get("id"):
+                send_message_timestamps[str(tool_use["id"])] = row.get("timestamp")
+        agent_id = get_resumed_agent_id_from_row(row)
+        if not agent_id:
+            continue
+        for tool_result_block in get_tool_result_blocks(get_content_from_row(row)):
+            tool_use_id = str(tool_result_block.get("tool_use_id") or "")
+            if tool_use_id not in send_message_timestamps:
+                continue
+            resume_start = parse_timestamp(send_message_timestamps[tool_use_id]) or parse_timestamp(row)
+            if resume_start is None:
+                continue
+            resumes.append({
+                "tool_use_id": tool_use_id,
+                "agent_id": agent_id,
+                "timestamp": _as_aware(resume_start),
+            })
+    return resumes
+
+def register_agent_resumes(
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
+    resumes: List[Dict[str, Any]],
+) -> None:
+    """Add an entry per resumed run, keyed by its SendMessage tool_use id, so
+    the run nests under that tool span the way a launch nests under its
+    Agent span.
+
+    The launch entry and all run entries of one agent share a single sorted
+    resume_starts list; select_agent_run_rows cuts the transcript there.
+    """
+    if subagent_transcripts_by_tool_use_id is None or not resumes:
+        return
+    launches_by_agent_id: Dict[str, Dict[str, Any]] = {}
+    for entry in subagent_transcripts_by_tool_use_id.values():
+        if isinstance(entry, dict) and not is_resumed_run_entry(entry):
+            agent_id = entry.get("agent_id")
+            if isinstance(agent_id, str) and agent_id:
+                launches_by_agent_id.setdefault(agent_id, entry)
+    for resume in resumes:
+        tool_use_id = resume.get("tool_use_id")
+        resume_start = resume.get("timestamp")
+        launch = launches_by_agent_id.get(resume.get("agent_id"))
+        if not tool_use_id or launch is None or not isinstance(resume_start, datetime):
+            continue
+        if tool_use_id in subagent_transcripts_by_tool_use_id:
+            continue
+        resume_starts = launch.setdefault("resume_starts", [])
+        if resume_start not in resume_starts:
+            resume_starts.append(resume_start)
+            resume_starts.sort()
+        subagent_transcripts_by_tool_use_id[tool_use_id] = {
+            **launch,
+            "tool_use_id": tool_use_id,
+            "launch_tool_use_id": launch.get("tool_use_id"),
+            "resume_start": resume_start,
+        }
+
+def is_coordinator_message_row(row: Dict[str, Any]) -> bool:
+    origin = row.get("origin")
+    return (
+        get_user_or_assistant_role_from_row(row) == "user"
+        and isinstance(origin, dict)
+        and origin.get("kind") == "coordinator"
+    )
+
+def is_prompt_row(row: Dict[str, Any]) -> bool:
+    return (
+        get_user_or_assistant_role_from_row(row) == "user"
+        and not is_tool_result(row)
+        and not is_task_notification_row(row)
+    )
+
+def find_resumed_run_start(rows: List[Dict[str, Any]], resume_start: datetime, search_from: int) -> int:
+    """Index of the row that opens a resumed run: the coordinator's message
+    written after the SendMessage call, else the first prompt row after it.
+    len(rows) when the run has not started (yet)."""
+    fallback: Optional[int] = None
+    for index in range(search_from, len(rows)):
+        row = rows[index]
+        timestamp = parse_timestamp(row)
+        if timestamp is None or _as_aware(timestamp) < resume_start:
+            continue
+        if is_coordinator_message_row(row):
+            return index
+        if fallback is None and is_prompt_row(row):
+            fallback = index
+    return fallback if fallback is not None else len(rows)
+
+def select_agent_run_rows(
+    subagent: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Cut one run out of an agent transcript.
+
+    Returns (run rows, run index, end index of the run in rows). Run 0 is
+    the launch; run k is the k-th resume. The first row of a resumed run is
+    the coordinator's isMeta message, promoted to the run's prompt.
+    """
+    resume_starts = [s for s in (subagent.get("resume_starts") or []) if isinstance(s, datetime)]
+    if not resume_starts:
+        return rows, 0, len(rows)
+    cuts = [0]
+    for resume_start in resume_starts:
+        cuts.append(find_resumed_run_start(rows, resume_start, min(cuts[-1] + 1, len(rows))))
+    cuts.append(len(rows))
+    run_index = 0
+    if is_resumed_run_entry(subagent) and subagent["resume_start"] in resume_starts:
+        run_index = resume_starts.index(subagent["resume_start"]) + 1
+    run_rows = rows[cuts[run_index]:cuts[run_index + 1]]
+    if run_index and run_rows and is_prompt_row(run_rows[0]) and run_rows[0].get("isMeta"):
+        promoted = dict(run_rows[0])
+        promoted.pop("isMeta", None)
+        run_rows = [promoted] + run_rows[1:]
+    return run_rows, run_index, cuts[run_index + 1]
+
+
+# ----------------- Agent definitions -----------------
+# Agents that ship inside Claude Code: their prompts live in the binary.
+BUILTIN_AGENT_TYPES = frozenset({
+    "general-purpose", "Explore", "Plan", "statusline-setup", "output-style-setup",
+    "claude-code-guide", "fork", "workflow-subagent", "claude",
+})
+_AGENT_DEFINITION_CACHE: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+MAX_AGENT_DEFINITION_CANDIDATES = 500
+
+def get_claude_config_dir() -> Path:
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        try:
+            return Path(override).expanduser()
+        except Exception:
+            pass
+    return Path.home() / ".claude"
+
+def parse_agent_definition_file(path: Path) -> Optional[Dict[str, Any]]:
+    """Split an agent .md file into flat frontmatter keys and the prompt body."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    frontmatter: Dict[str, str] = {}
+    body = text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end >= 0:
+            header = text[3:end]
+            rest = text[end + 4:]
+            newline = rest.find("\n")
+            body = rest[newline + 1:] if newline >= 0 else ""
+            for line in header.splitlines():
+                if not line or line[0].isspace() or ":" not in line:
+                    continue
+                key, _, value = line.partition(":")
+                frontmatter[key.strip()] = value.strip().strip("'\"")
+    return {"frontmatter": frontmatter, "body": body.strip()}
+
+def find_agent_definition_in_dir(agents_dir: Path, name: str) -> Optional[Tuple[Path, Dict[str, Any]]]:
+    """Find the agent file whose frontmatter name (else file name) is `name`."""
+    try:
+        if not agents_dir.is_dir():
+            return None
+        candidates = sorted(agents_dir.rglob("*.md"))[:MAX_AGENT_DEFINITION_CANDIDATES]
+    except OSError:
+        return None
+    for candidate in sorted(candidates, key=lambda p: p.stem != name):
+        parsed = parse_agent_definition_file(candidate)
+        if parsed is None:
+            continue
+        declared = parsed["frontmatter"].get("name")
+        if declared == name or (not declared and candidate.stem == name):
+            return candidate, parsed
+    return None
+
+def iter_project_dirs(cwd: Optional[str]) -> List[Path]:
+    """cwd and its parents, stopping below the home directory (whose
+    .claude/agents holds user agents, not project agents)."""
+    if not isinstance(cwd, str) or not cwd:
+        return []
+    try:
+        current = Path(cwd).expanduser()
+        home = Path.home()
+    except Exception:
+        return []
+    dirs: List[Path] = []
+    while True:
+        if current == home:
+            break
+        dirs.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    return dirs
+
+def get_plugin_install_paths(plugin_name: str) -> List[Path]:
+    registry = get_claude_config_dir() / "plugins" / "installed_plugins.json"
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    install_paths: List[Path] = []
+    if not isinstance(plugins, dict):
+        return install_paths
+    for plugin_key, installs in plugins.items():
+        if not isinstance(plugin_key, str) or plugin_key.split("@", 1)[0] != plugin_name:
+            continue
+        for install in installs if isinstance(installs, list) else []:
+            install_path = install.get("installPath") if isinstance(install, dict) else None
+            if isinstance(install_path, str) and install_path:
+                install_paths.append(Path(install_path))
+    return install_paths
+
+def _resolve_agent_definition_uncached(name: str, cwd: Optional[str]) -> Dict[str, Any]:
+    found: Optional[Tuple[Path, Dict[str, Any]]] = None
+    source = "unknown"
+    if ":" in name:
+        # Plugin agents are addressed as <plugin>:<frontmatter name>.
+        plugin_name, _, agent_name = name.partition(":")
+        for install_path in get_plugin_install_paths(plugin_name):
+            found = find_agent_definition_in_dir(install_path / "agents", agent_name)
+            if found:
+                source = "plugin"
+                break
+    else:
+        for directory in iter_project_dirs(cwd):
+            found = find_agent_definition_in_dir(directory / ".claude" / "agents", name)
+            if found:
+                source = "project"
+                break
+        if not found:
+            found = find_agent_definition_in_dir(get_claude_config_dir() / "agents", name)
+            if found:
+                source = "user"
+    if found:
+        path, parsed = found
+        definition: Dict[str, Any] = {"name": name, "source": source, "path": str(path), "builtin": False}
+        for key in ("description", "model", "tools"):
+            value = parsed["frontmatter"].get(key)
+            if value:
+                definition[key] = value[:300]
+        definition["body"] = parsed["body"]
+        return definition
+    if name in BUILTIN_AGENT_TYPES:
+        return {"name": name, "source": "builtin", "builtin": True}
+    return {"name": name, "source": source, "builtin": False}
+
+def resolve_agent_definition(name: Any, cwd: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Locate the file that defines an agent (its system prompt).
+
+    Search order follows Claude Code: project .claude/agents (walking up from
+    cwd), then the user's agents dir, then installed plugins for
+    <plugin>:<name>. Built-in agents are only marked; agents passed via
+    --agents JSON or --plugin-dir resolve to "unknown".
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    cache_key = (name, cwd or "")
+    if cache_key not in _AGENT_DEFINITION_CACHE:
+        try:
+            _AGENT_DEFINITION_CACHE[cache_key] = _resolve_agent_definition_uncached(name, cwd)
+        except Exception as e:
+            debug(f"agent definition lookup failed for {name!r}: {type(e).__name__}: {e}")
+            _AGENT_DEFINITION_CACHE[cache_key] = {"name": name, "source": "unknown", "builtin": False}
+    return _AGENT_DEFINITION_CACHE[cache_key]
+
+def agent_definition_metadata(definition: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not definition:
+        return None
+    return {key: value for key, value in definition.items() if key != "body"}
+
+
+# ----------------- Instructions and system prompt -----------------
+@dataclass
+class AgentContext:
+    """What an agent was given besides its prompt: system prompt and
+    instruction files (CLAUDE.md, rules, nested memory), plus hook context."""
+    instruction_files: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    system_prompt: List[str] = field(default_factory=list)
+    cli_prefix: Optional[str] = None
+    tool_names: List[str] = field(default_factory=list)
+    hook_context: List[Dict[str, Any]] = field(default_factory=list)
+
+HOOK_INSTRUCTION_FIELDS = ("load_reason", "globs", "trigger_file_path", "parent_file_path")
+
+def add_instruction_file(context: AgentContext, path: Any, memory_type: Any, content: Any,
+                         load_reason: Optional[str] = None) -> None:
+    if not isinstance(path, str) or not path:
+        return
+    entry = context.instruction_files.setdefault(path, {"path": path, "source": "transcript"})
+    if isinstance(memory_type, str) and memory_type:
+        entry["memory_type"] = memory_type
+    if isinstance(content, str):
+        entry["content"] = content
+    if load_reason and not entry.get("load_reason"):
+        entry["load_reason"] = load_reason
+
+def add_context_from_attachment_row(context: AgentContext, row: Dict[str, Any]) -> None:
+    attachment = row.get("attachment") if row.get("type") == "attachment" else None
+    if not isinstance(attachment, dict):
+        return
+    kind = attachment.get("type")
+    if kind == "instructions":
+        files = attachment.get("files")
+        for instruction_file in files if isinstance(files, list) else []:
+            if isinstance(instruction_file, dict):
+                add_instruction_file(
+                    context, instruction_file.get("path"), instruction_file.get("type"),
+                    instruction_file.get("content"),
+                )
+    elif kind == "nested_memory":
+        content = attachment.get("content")
+        if isinstance(content, dict):
+            add_instruction_file(
+                context, content.get("path") or attachment.get("path"), content.get("type"),
+                content.get("content"), load_reason="nested_memory",
+            )
+    elif kind == "prompt_snapshot":
+        system_prompt = attachment.get("systemPrompt")
+        if isinstance(system_prompt, str):
+            system_prompt = [system_prompt]
+        if isinstance(system_prompt, list):
+            sections = [section for section in system_prompt if isinstance(section, str)]
+            if sections:
+                context.system_prompt = sections
+        cli_prefix = attachment.get("cliPrefix")
+        if isinstance(cli_prefix, str) and cli_prefix:
+            context.cli_prefix = cli_prefix
+        tools = attachment.get("tools")
+        if isinstance(tools, list):
+            tool_names = [tool.get("name") for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)]
+            if tool_names:
+                context.tool_names = tool_names
+    elif kind == "hook_additional_context":
+        content = attachment.get("content")
+        texts = [c for c in content if isinstance(c, str)] if isinstance(content, list) else (
+            [content] if isinstance(content, str) else []
+        )
+        if texts:
+            context.hook_context.append({
+                "hook": attachment.get("hookName") or attachment.get("hookEvent"),
+                "content": "\n".join(texts),
+            })
+
+def is_context_attachment_row(row: Dict[str, Any]) -> bool:
+    attachment = row.get("attachment") if row.get("type") == "attachment" else None
+    return isinstance(attachment, dict) and attachment.get("type") in (
+        "instructions", "nested_memory", "prompt_snapshot", "hook_additional_context",
+    )
+
+def extract_agent_context(rows: List[Dict[str, Any]]) -> AgentContext:
+    context = AgentContext()
+    for row in rows:
+        if isinstance(row, dict) and is_context_attachment_row(row):
+            add_context_from_attachment_row(context, row)
+    return context
+
+def merge_hook_instruction_records(context: AgentContext, records: List[Dict[str, Any]]) -> None:
+    """Fold InstructionsLoaded records into the transcript view: the hook
+    adds why a file loaded; the transcript content wins where both exist."""
+    for record in records:
+        if record.get("event") != "InstructionsLoaded":
+            continue
+        path = record.get("file_path")
+        if not isinstance(path, str) or not path:
+            continue
+        entry = context.instruction_files.get(path)
+        if entry is None:
+            entry = context.instruction_files[path] = {"path": path, "source": "hook"}
+            if isinstance(record.get("content"), str):
+                entry["content"] = record["content"]
+                if record.get("truncated"):
+                    entry["content_truncated_at_record"] = True
+        elif entry.get("source") == "transcript":
+            entry["source"] = "transcript+hook"
+        if isinstance(record.get("memory_type"), str) and not entry.get("memory_type"):
+            entry["memory_type"] = record["memory_type"]
+        for key in HOOK_INSTRUCTION_FIELDS:
+            value = record.get(key)
+            if value and (not entry.get(key) or entry.get(key) == "nested_memory"):
+                entry[key] = value
+
+def get_context_file_path(session_id: str) -> Path:
+    safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id)[:128] or "unknown"
+    return STATE_DIR / CONTEXT_DIR_NAME / f"{safe_id}.jsonl"
+
+def load_context_records(session_id: Optional[str]) -> List[Dict[str, Any]]:
+    """Records written by langfuse_context_hook.py for this session."""
+    if not session_id:
+        return []
+    try:
+        lines = get_context_file_path(session_id).read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    records: List[Dict[str, Any]] = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+def record_matches_agent(record: Dict[str, Any], agent_id: Optional[str]) -> bool:
+    record_agent_id = record.get("agent_id")
+    if not agent_id:
+        return not record_agent_id
+    return record_agent_id in (agent_id, f"agent-{agent_id}")
+
+@dataclass
+class SessionIndex:
+    """One pass over the whole main transcript, shared by the firing."""
+    index_by_uuid: Dict[str, int] = field(default_factory=dict)
+    context_rows: List[Tuple[int, Dict[str, Any]]] = field(default_factory=list)
+    agent_settings: List[Tuple[int, str]] = field(default_factory=list)
+    resumes: List[Dict[str, Any]] = field(default_factory=list)
+
+def build_session_index(rows: Optional[List[Dict[str, Any]]]) -> SessionIndex:
+    index = SessionIndex()
+    for row_index, row in enumerate(rows or []):
+        if not isinstance(row, dict):
+            continue
+        uuid = row.get("uuid")
+        if isinstance(uuid, str) and uuid:
+            index.index_by_uuid[uuid] = row_index
+        if row.get("type") == "agent-setting":
+            agent_setting = row.get("agentSetting")
+            if isinstance(agent_setting, str) and agent_setting:
+                index.agent_settings.append((row_index, agent_setting))
+        elif is_context_attachment_row(row):
+            index.context_rows.append((row_index, row))
+    index.resumes = get_agent_resumes_from_rows(rows or [])
+    return index
+
+@dataclass
+class SessionContext:
+    """Per-firing view of who the agents are and what they were told."""
+    session_id: str = ""
+    index: Optional[SessionIndex] = None
+    records: List[Dict[str, Any]] = field(default_factory=list)
+    # Main agent name from outside the transcript (hook payload, state,
+    # SessionStart record), used when no agent-setting row precedes a turn.
+    fallback_main_agent: str = ""
+
+    def turn_end_index(self, turn: Turn) -> Optional[int]:
+        if self.index is None:
+            return None
+        indices = [
+            self.index.index_by_uuid[row.get("uuid")]
+            for row in turn.rows
+            if isinstance(row, dict) and row.get("uuid") in self.index.index_by_uuid
+        ]
+        return max(indices) if indices else None
+
+    def main_agent_for_turn(self, turn: Turn) -> str:
+        if self.index is not None and self.index.agent_settings:
+            end_index = self.turn_end_index(turn)
+            name = ""
+            for row_index, agent_setting in self.index.agent_settings:
+                if end_index is not None and row_index > end_index and name:
+                    break
+                name = agent_setting
+            if name:
+                return name
+        return self.fallback_main_agent
+
+    def main_context_for_turn(self, turn: Turn) -> AgentContext:
+        context = AgentContext()
+        if self.index is not None:
+            end_index = self.turn_end_index(turn)
+            for row_index, row in self.index.context_rows:
+                if end_index is not None and row_index > end_index:
+                    break
+                add_context_from_attachment_row(context, row)
+        turn_end = get_turn_end_timestamp(turn)
+        merge_hook_instruction_records(context, [
+            record for record in self.records
+            if record_matches_agent(record, None) and _record_before(record, turn_end)
+        ])
+        return context
+
+    def agent_context(self, agent_id: Optional[str], rows: List[Dict[str, Any]]) -> AgentContext:
+        context = extract_agent_context(rows)
+        if agent_id:
+            merge_hook_instruction_records(context, [
+                record for record in self.records if record_matches_agent(record, agent_id)
+            ])
+        return context
+
+    def session_start_agent(self) -> str:
+        for record in reversed(self.records):
+            if record.get("event") == "SessionStart" and not record.get("agent_id"):
+                agent_type = record.get("agent_type")
+                if isinstance(agent_type, str) and agent_type:
+                    return agent_type
+        return ""
+
+def build_session_context(
+    session_id: str,
+    full_rows: Optional[List[Dict[str, Any]]],
+    session_state: SessionState,
+    payload_agent_type: Optional[str] = None,
+) -> SessionContext:
+    """Index the whole main transcript once and settle the main agent name.
+
+    Precedence per turn: the transcript's agent-setting rows, then the hook
+    payload's agent_type, the SessionStart record, and the name persisted by
+    an earlier firing. The newest known name is persisted for later firings.
+    """
+    context = SessionContext(
+        session_id=session_id,
+        index=build_session_index(full_rows),
+        records=load_context_records(session_id),
+    )
+    context.fallback_main_agent = (
+        (payload_agent_type if isinstance(payload_agent_type, str) else "")
+        or context.session_start_agent()
+        or session_state.main_agent
+    )
+    agent_settings = context.index.agent_settings if context.index is not None else []
+    latest_main_agent = agent_settings[-1][1] if agent_settings else context.fallback_main_agent
+    if latest_main_agent:
+        session_state.main_agent = latest_main_agent
+    return context
+
+CONTEXT_FILE_MAX_AGE = timedelta(days=30)
+
+def sweep_stale_context_files(now: Optional[datetime] = None) -> None:
+    """Drop InstructionsLoaded/SessionStart record files of long-gone sessions."""
+    cutoff = ((now or datetime.now(timezone.utc)) - CONTEXT_FILE_MAX_AGE).timestamp()
+    try:
+        for path in (STATE_DIR / CONTEXT_DIR_NAME).glob("*.jsonl"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+    except OSError:
+        return
+
+def _record_before(record: Dict[str, Any], limit: Optional[datetime]) -> bool:
+    if limit is None:
+        return True
+    timestamp = parse_timestamp(record.get("ts"))
+    return timestamp is None or _as_aware(timestamp) <= _as_aware(limit)
+
+def build_instructions_observation_payload(
+    agent_name: Optional[str],
+    context: AgentContext,
+    definition: Optional[Dict[str, Any]],
+) -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
+    """ChatML input (system prompt, then one message per instruction file)
+    and metadata for an agent's "Instructions" observation. None when both
+    captures are off or there is nothing to show."""
+    messages: List[Dict[str, Any]] = []
+    metadata: Dict[str, Any] = {"agent": agent_name}
+    if CAPTURE_SYSTEM_PROMPT:
+        sections = list(context.system_prompt)
+        source = "transcript"
+        if not sections and definition and definition.get("body"):
+            sections = [definition["body"]]
+            source = "agent_definition"
+        if sections:
+            full_text = "\n\n".join(sections)
+            text, text_meta = truncate_text(full_text)
+            messages.append({"role": "system", "content": text})
+            metadata["system_prompt"] = {
+                "source": source,
+                "sections": len(sections),
+                "chars": len(full_text),
+                "sha256": hashlib.sha256(full_text.encode("utf-8")).hexdigest(),
+                "truncated": text_meta.get("truncated", False),
+            }
+            if context.cli_prefix:
+                metadata["system_prompt"]["cli_prefix"] = context.cli_prefix
+        if context.tool_names:
+            metadata["tools"] = context.tool_names
+    if CAPTURE_INSTRUCTIONS:
+        for entry in context.instruction_files.values():
+            content = entry.get("content")
+            if isinstance(content, str):
+                text, _ = truncate_text(content)
+                label = entry.get("memory_type") or "instructions"
+                messages.append({"role": "user", "content": f"Contents of {entry['path']} ({label}):\n\n{text}"})
+        for hook_context in context.hook_context:
+            text, _ = truncate_text(hook_context.get("content") or "")
+            messages.append({"role": "user", "content": f"{hook_context.get('hook') or 'Hook'} additional context:\n\n{text}"})
+        files = build_instruction_file_list(context)
+        if files:
+            metadata["instruction_files"] = files
+    definition_meta = agent_definition_metadata(definition)
+    if definition_meta:
+        metadata["agent_definition"] = definition_meta
+    if not messages:
+        return None
+    return messages, metadata
+
+def build_instruction_file_list(context: AgentContext) -> List[Dict[str, Any]]:
+    """The instruction files without their contents, for metadata."""
+    if not CAPTURE_INSTRUCTIONS:
+        return []
+    files: List[Dict[str, Any]] = []
+    for entry in context.instruction_files.values():
+        item: Dict[str, Any] = {"path": entry["path"]}
+        for key in ("memory_type", *HOOK_INSTRUCTION_FIELDS, "source"):
+            if entry.get(key):
+                item[key] = entry[key]
+        content = entry.get("content")
+        if isinstance(content, str):
+            item["chars"] = len(content)
+            item["sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        files.append(item)
+    return files
+
+def emit_instructions_observation(
+    langfuse: Langfuse,
+    parent_otel_span: Any,
+    agent_name: Optional[str],
+    context: AgentContext,
+    definition: Optional[Dict[str, Any]],
+    timestamp: Optional[datetime],
+) -> None:
+    payload = build_instructions_observation_payload(agent_name, context, definition)
+    if payload is None:
+        return
+    messages, metadata = payload
+    observation = _start_backdated(
+        langfuse,
+        name="Instructions",
+        as_type="span",
+        start_time=timestamp,
+        parent_otel_span=parent_otel_span,
+        input=messages,
+        metadata=metadata,
+    )
+    observation.end(end_time=to_otel_nanoseconds(timestamp))
+
+
+# ----------------- Agent tree -----------------
+@dataclass
+class AgentNesting:
+    """Where an emission sits in the agent tree; passed down the recursion."""
+    depth: int = 0
+    ancestry: Tuple[str, ...] = ()
+    session_context: Optional[SessionContext] = None
+    # Added to the metadata of generations and tools inside a subagent.
+    scope_metadata: Dict[str, Any] = field(default_factory=dict)
+
+def get_agent_key(subagent: Dict[str, Any]) -> str:
+    agent_id = subagent.get("agent_id")
+    return agent_id if isinstance(agent_id, str) and agent_id else str(subagent.get("path"))
+
+DEFAULT_MAIN_AGENT = "claude"
+
+def is_default_main_agent(main_agent: Optional[str]) -> bool:
+    return not main_agent or main_agent == DEFAULT_MAIN_AGENT
+
+def get_subagent_observation_name(subagent: Dict[str, Any], run_index: int = 0) -> str:
+    parts = [
+        value for value in (subagent.get("agent_type"), subagent.get("description"))
+        if isinstance(value, str) and value
+    ]
+    name = f"Subagent: {' · '.join(parts)}" if parts else "Subagent"
+    return f"{name} (resumed #{run_index})" if run_index else name
+
+def get_rows_cwd(rows: List[Dict[str, Any]]) -> Optional[str]:
+    for row in rows:
+        cwd = row.get("cwd") if isinstance(row, dict) else None
+        if isinstance(cwd, str) and cwd:
+            return cwd
+    return None
+
+def iter_descendant_agent_runs(
+    rows: List[Dict[str, Any]],
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
+    ancestry: Tuple[str, ...] = (),
+) -> Iterator[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
+    """Every agent run launched (or resumed) from these rows, at any depth."""
+    if not subagent_transcripts_by_tool_use_id or len(ancestry) >= MAX_AGENT_DEPTH:
+        return
+    for row in rows:
+        for tool_use in get_tool_use_blocks(get_content_from_row(row)):
+            tool_use_id = str(tool_use.get("id") or "")
+            subagent = subagent_transcripts_by_tool_use_id.get(tool_use_id) if tool_use_id else None
+            if not isinstance(subagent, dict) or not isinstance(subagent.get("path"), Path):
+                continue
+            agent_key = get_agent_key(subagent)
+            if agent_key in ancestry:
+                continue
+            agent_rows = read_subagent_jsonl(subagent["path"])
+            if not agent_rows:
+                continue
+            run_rows, _, _ = select_agent_run_rows(subagent, agent_rows)
+            register_agent_resumes(subagent_transcripts_by_tool_use_id, get_agent_resumes_from_rows(run_rows))
+            yield subagent, run_rows
+            yield from iter_descendant_agent_runs(
+                run_rows, subagent_transcripts_by_tool_use_id, ancestry + (agent_key,)
+            )
 
 
 # ----------------- Langfuse emit -----------------
@@ -2012,34 +2788,57 @@ def collect_subagent_skill_tags(
     Kept in a separate tag namespace so 'skill:' keeps meaning "ran in the
     main conversation" and both dimensions stay filterable independently.
     """
-    if not subagent_transcripts_by_tool_use_id:
-        return []
+    return get_subagent_skill_tags_from_runs(
+        list(iter_descendant_agent_runs(turn.assistant_msgs, subagent_transcripts_by_tool_use_id))
+    )
+
+def get_subagent_skill_tags_from_runs(
+    agent_runs: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+) -> List[str]:
     names: List[str] = []
-    for assistant_message in turn.assistant_msgs:
-        for tool_use in get_tool_use_blocks(get_content_from_row(assistant_message)):
-            tool_use_id = str(tool_use.get("id") or "")
-            subagent = subagent_transcripts_by_tool_use_id.get(tool_use_id) if tool_use_id else None
-            if not isinstance(subagent, dict):
-                continue
-            path = subagent.get("path")
-            if not isinstance(path, Path):
-                continue
-            rows = read_subagent_jsonl(path)
-            if rows:
-                add_skill_tags_from_rows(rows, names, "subagent-skill:")
+    for _, rows in agent_runs:
+        add_skill_tags_from_rows(rows, names, "subagent-skill:")
     return names
 
-# Constant on purpose: a shared trace name keeps Langfuse name-based grouping usable.
+def get_agent_tags(
+    main_agent: Optional[str],
+    agent_runs: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+) -> List[str]:
+    """'agent:<main agent>' plus 'subagent:<type>' for every agent type that
+    ran anywhere below the turn."""
+    tags: List[str] = [f"agent:{main_agent}"] if main_agent else []
+    for subagent, _ in agent_runs:
+        agent_type = subagent.get("agent_type")
+        if isinstance(agent_type, str) and agent_type and f"subagent:{agent_type}" not in tags:
+            tags.append(f"subagent:{agent_type}")
+    return tags
+
+# A shared trace name keeps Langfuse name-based grouping usable; a custom
+# main agent gets its own group.
 TRACE_NAME = "Claude Code Turn"
+ROOT_OBSERVATION_NAME = "Conversational Turn"
+
+def get_trace_name(main_agent: Optional[str] = None) -> str:
+    return TRACE_NAME if is_default_main_agent(main_agent) else f"{main_agent} · {TRACE_NAME}"
+
+def get_root_observation_name(main_agent: Optional[str] = None) -> str:
+    if is_default_main_agent(main_agent):
+        return ROOT_OBSERVATION_NAME
+    return f"{main_agent} · {ROOT_OBSERVATION_NAME}"
 
 def get_trace_tags(
     turn: Turn,
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    main_agent: Optional[str] = None,
+    agent_runs: Optional[List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]] = None,
 ) -> List[str]:
     tags = ["claude-code"]
+    if agent_runs is None:
+        agent_runs = list(iter_descendant_agent_runs(turn.assistant_msgs, subagent_transcripts_by_tool_use_id))
+    tags +=[tag for tag in get_agent_tags(main_agent, agent_runs) if tag not in tags]
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
-        tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
+        tags += get_subagent_skill_tags_from_runs(agent_runs)
     tags += [tag for tag in OPERATOR_TAGS if tag not in tags]
     return tags
 
@@ -2170,13 +2969,16 @@ class SessionHistory:
 def build_session_history(
     transcript_path: Path,
     task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+    rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[SessionHistory]:
     """Rebuild the conversation of the whole transcript file as ChatML.
 
     Reads from byte 0 on purpose: the emission offset only tracks what was
-    exported, while a generation input needs every earlier message.
+    exported, while a generation input needs every earlier message. Callers
+    that already read the whole file pass its rows.
     """
-    rows = read_subagent_jsonl(transcript_path)
+    if rows is None:
+        rows = read_subagent_jsonl(transcript_path)
     if not rows:
         return None
     history = SessionHistory()
@@ -2297,6 +3099,7 @@ def build_tool_metadata(
     }
     if subagent:
         tool_metadata.update({
+            "subagent_id": subagent.get("agent_id"),
             "subagent_type": subagent.get("agent_type"),
             "subagent_description": subagent.get("description"),
             "subagent_transcript_path": get_short_transcript_path_for_metadata(subagent.get("path")),
@@ -2345,11 +3148,11 @@ def emit_single_tool_observation(
     assistant_timestamp: Optional[datetime],
     tool_use: Dict[str, Any],
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
-    pending_subagents: List[Dict[str, Any]],
     pending_async_tool_results: List[Dict[str, Any]],
     cursor: EmissionCursor,
     tool_key: str,
     workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
+    nesting: Optional["AgentNesting"] = None,
 ) -> EmittedSingleToolObservation:
     tool_use_id = str(tool_use.get("id") or "")
     tool_name = tool_use.get("name") or "unknown"
@@ -2390,11 +3193,31 @@ def emit_single_tool_observation(
         if workflow_agents:
             tool_metadata["workflow_agent_count"] = len(workflow_agents)
 
+    if nesting is not None and nesting.scope_metadata:
+        tool_metadata.update(nesting.scope_metadata)
+
     tool_use_timestamp = parse_timestamp(turn.tool_use_timestamps_by_id.get(tool_use_id)) or assistant_timestamp
+    # Without a final result the subagent may still be running: its
+    # transcript on disk is not authoritative yet. No tool_result row
+    # at all means the tool (sync agents included) is still executing,
+    # so completeness must fail closed like the neighboring gates.
+    subagent_still_running = bool(subagent) and (
+        tool_result_entry is None
+        or (
+            is_async_agent_launch_result(tool_result_entry)
+            and (
+                not isinstance(tool_result_entry, dict)
+                or tool_result_entry.get("final_content") is None
+            )
+        )
+    )
     # A tool span's end time comes from its result row, so it only counts as
-    # complete once that row exists.
+    # complete once that row exists. An agent launch also spans its agent's
+    # run, so it waits until the agent is done and both ship together.
     tool_span = None
-    if cursor.should_emit(tool_key, complete=tool_result_entry is not None):
+    if cursor.should_emit(
+        tool_key, complete=tool_result_entry is not None and not subagent_still_running
+    ):
         tool_span = _start_backdated(
             langfuse,
             name=f"Tool: {tool_name}",
@@ -2406,35 +3229,22 @@ def emit_single_tool_observation(
             **get_status_kwargs(tool_result.status),
         )
         tool_span.update(output=tool_output)
+    # tool_span is None only when an earlier firing already exported it;
+    # agents discovered late then nest under the parent span instead.
+    child_parent_otel_span = tool_span._otel_span if tool_span is not None else parent_otel_span
 
     subagent_end_timestamp = None
-    if subagent:
-        if tool_result.final_result_timestamp is not None:
-            pending_subagents.append({
-                "tool_use_id": tool_use_id,
-                "subagent": subagent,
-                "start_timestamp": tool_use_timestamp,
-                "ready_timestamp": tool_result.final_result_timestamp,
-            })
-        else:
-            # Without a final result the subagent may still be running: its
-            # transcript on disk is not authoritative yet. No tool_result row
-            # at all means the tool (sync agents included) is still executing,
-            # so completeness must fail closed like the neighboring gates.
-            subagent_still_running = tool_result_entry is None or (
-                is_async_agent_launch_result(tool_result_entry)
-                and (
-                    not isinstance(tool_result_entry, dict)
-                    or tool_result_entry.get("final_content") is None
-                )
-            )
-            if cursor.should_emit(f"subagent:{tool_use_id or tool_key}", complete=not subagent_still_running):
-                subagent_end_timestamp = emit_subagent_observations(
-                    langfuse,
-                    parent_otel_span,
-                    subagent,
-                    tool_use_timestamp,
-                )
+    if subagent and cursor.should_emit(
+        f"subagent:{tool_use_id or tool_key}", complete=not subagent_still_running
+    ):
+        subagent_end_timestamp = emit_subagent_observations(
+            langfuse,
+            child_parent_otel_span,
+            subagent,
+            tool_use_timestamp,
+            nesting=nesting,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+        )
 
     workflow_end_timestamp = None
     if workflow_agents:
@@ -2446,21 +3256,21 @@ def emit_single_tool_observation(
         )
         workflow_end_timestamp = emit_workflow_agent_observations(
             langfuse,
-            # tool_span is None only when an earlier firing already exported
-            # it; late-discovered agents then nest under the turn root instead.
-            tool_span._otel_span if tool_span is not None else parent_otel_span,
+            child_parent_otel_span,
             workflow_agents,
             workflow_run_id=workflow_run_id,
             workflow_name=workflow_name,
             workflow_resolved=workflow_resolved,
             cursor=cursor,
             emission_scope=tool_use_id or tool_key,
+            nesting=nesting,
         )
 
     # Exported spans are immutable, so the end time set here must already
-    # cover the workflow agents nested under this span.
+    # cover the agents nested under this span.
     tool_end_timestamp = _get_latest_timestamp(
-        tool_result.result_timestamp, tool_use_timestamp, workflow_end_timestamp
+        tool_result.result_timestamp, tool_use_timestamp, workflow_end_timestamp,
+        subagent_end_timestamp,
     )
     handoff_timestamp = (
         tool_result.result_timestamp
@@ -2501,10 +3311,10 @@ def emit_tool_observation_batch(
     assistant_index: int,
     tool_uses: List[Dict[str, Any]],
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
-    pending_subagents: List[Dict[str, Any]],
     pending_async_tool_results: List[Dict[str, Any]],
     cursor: EmissionCursor,
     workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
+    nesting: Optional["AgentNesting"] = None,
 ) -> EmittedToolObservationBatch:
     assistant_timestamp = parse_timestamp(assistant_message)
     generation_key = generation_emission_key(assistant_index, assistant_message)
@@ -2522,11 +3332,11 @@ def emit_tool_observation_batch(
             assistant_timestamp,
             tool_use,
             subagent_transcripts_by_tool_use_id,
-            pending_subagents,
             pending_async_tool_results,
             cursor,
             tool_key,
             workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+            nesting=nesting,
         )
         if emitted_tool.handoff_timestamp is not None:
             tool_result_timestamps.append(emitted_tool.handoff_timestamp)
@@ -2543,22 +3353,6 @@ def emit_tool_observation_batch(
     )
 
 # ---- Turn and subagent observations ----
-def get_ready_subagents(
-    pending_subagents: List[Dict[str, Any]],
-    assistant_timestamp: Optional[datetime],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    ready_subagents: List[Dict[str, Any]] = []
-    still_pending_subagents: List[Dict[str, Any]] = []
-    for pending_subagent in pending_subagents:
-        ready_timestamp = pending_subagent.get("ready_timestamp")
-        if isinstance(ready_timestamp, datetime) and (
-            assistant_timestamp is None or ready_timestamp <= assistant_timestamp
-        ):
-            ready_subagents.append(pending_subagent)
-        else:
-            still_pending_subagents.append(pending_subagent)
-    return ready_subagents, still_pending_subagents
-
 def get_ready_async_tool_results(
     pending_async_tool_results: List[Dict[str, Any]],
     assistant_timestamp: Optional[datetime],
@@ -2580,30 +3374,6 @@ def get_ready_async_tool_results(
         if isinstance(result.get("timestamp"), datetime)
     ])
     return ready_async_tool_results, still_pending_tool_results, latest_ready_timestamp
-
-def update_pending_subagent_display_start_after_launch_response(
-    pending_subagents: List[Dict[str, Any]],
-    tool_results_used_as_generation_input: List[Dict[str, Any]],
-    generation_start_timestamp: Optional[datetime],
-) -> None:
-    if generation_start_timestamp is None:
-        return
-
-    tool_use_ids = {
-        str(tool_result.get("tool_use_id"))
-        for tool_result in tool_results_used_as_generation_input
-        if isinstance(tool_result, dict) and tool_result.get("tool_use_id")
-    }
-    if not tool_use_ids:
-        return
-
-    for pending_subagent in pending_subagents:
-        if pending_subagent.get("display_start_timestamp") is not None:
-            continue
-        if pending_subagent.get("tool_use_id") in tool_use_ids:
-            pending_subagent["display_start_timestamp"] = generation_start_timestamp + timedelta(
-                microseconds=1
-            )
 
 def build_generation_kwargs(
     assistant_index: int,
@@ -2666,7 +3436,8 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                            subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
                            cursor: Optional[EmissionCursor] = None,
                            workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
-                           history_prefix: Optional[List[Dict[str, Any]]] = None) -> Optional[datetime]:
+                           history_prefix: Optional[List[Dict[str, Any]]] = None,
+                           nesting: Optional["AgentNesting"] = None) -> Optional[datetime]:
     """Emit a turn's generations and tool observations under an existing span.
 
     The full turn is always walked so cross-observation context (generation
@@ -2678,6 +3449,9 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
     that point: the prefix, this turn's user message, and the earlier steps
     of this turn. Callers pass None when the history is not available,
     and the inputs then keep the delta form.
+
+    Agent launches expand recursively under their tool spans; nesting says
+    where this turn sits in the agent tree (None: the main conversation).
     """
     cursor = cursor if cursor is not None else fresh_cursor()
     user_text, _ = truncate_text(extract_text_from_content(get_content_from_row(turn.user_msg)))
@@ -2692,35 +3466,13 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
     previous_timestamp = start_timestamp
     previous_tool_results: List[Dict[str, Any]] = []
     pending_async_tool_results: List[Dict[str, Any]] = []
-    pending_subagents: List[Dict[str, Any]] = []
     latest_end_timestamp = start_timestamp
     # True once the walk passed an async launch whose final result is still
     # missing; later generations' inputs can then still change retroactively.
     unresolved_async_launch_seen = False
 
-    def emit_pending_subagent(pending_subagent: Dict[str, Any]) -> None:
-        nonlocal latest_end_timestamp
-        subagent_key = f"subagent:{pending_subagent.get('tool_use_id')}"
-        if not cursor.should_emit(subagent_key, complete=True):
-            return
-        subagent_end_timestamp = emit_subagent_observations(
-            langfuse,
-            parent_otel_span,
-            pending_subagent["subagent"],
-            pending_subagent.get("display_start_timestamp") or pending_subagent.get("start_timestamp"),
-        )
-        latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
-
     for assistant_index, assistant_message in enumerate(turn.assistant_msgs):
         assistant_timestamp = parse_timestamp(assistant_message)
-        if assistant_index > 0 and pending_subagents:
-            ready_subagents, pending_subagents = get_ready_subagents(
-                pending_subagents,
-                assistant_timestamp,
-            )
-            for ready_subagent in ready_subagents:
-                emit_pending_subagent(ready_subagent)
-
         ready_async_tool_results: List[Dict[str, Any]] = []
         if assistant_index > 0 and pending_async_tool_results:
             ready_async_tool_results, pending_async_tool_results, ready_async_result_timestamp = (
@@ -2743,6 +3495,8 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
         if history_messages is not None:
             generation_kwargs["input"] = list(history_messages)
             generation_kwargs["metadata"]["history"] = {"messages": len(history_messages)}
+        if nesting is not None and nesting.scope_metadata:
+            generation_kwargs["metadata"].update(nesting.scope_metadata)
         generation_start_timestamp = previous_timestamp or assistant_timestamp
         # A generation is only complete when its emitted form cannot change
         # anymore and its tool spans can ship with it: (a) every tool_use of
@@ -2771,12 +3525,6 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                 start_timestamp=generation_start_timestamp,
                 generation_kwargs=generation_kwargs,
             )
-        update_pending_subagent_display_start_after_launch_response(
-            pending_subagents,
-            previous_tool_results,
-            generation_start_timestamp,
-        )
-
         emitted_tools = emit_tool_observation_batch(
             langfuse,
             parent_otel_span,
@@ -2785,10 +3533,10 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             assistant_index,
             tool_uses,
             subagent_transcripts_by_tool_use_id,
-            pending_subagents,
             pending_async_tool_results,
             cursor,
             workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+            nesting=nesting,
         )
         latest_end_timestamp = _get_latest_timestamp(
             latest_end_timestamp,
@@ -2828,9 +3576,6 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
         elif assistant_timestamp is not None:
             previous_timestamp = assistant_timestamp
 
-    for pending_subagent in pending_subagents:
-        emit_pending_subagent(pending_subagent)
-
     return latest_end_timestamp
 
 def emit_workflow_agent_observations(
@@ -2843,6 +3588,7 @@ def emit_workflow_agent_observations(
     workflow_resolved: bool,
     cursor: EmissionCursor,
     emission_scope: str,
+    nesting: Optional["AgentNesting"] = None,
 ) -> Optional[datetime]:
     """Emit each workflow-spawned agent transcript under the launching
     "Tool: Workflow" span.
@@ -2886,6 +3632,7 @@ def emit_workflow_agent_observations(
             # (no text in the final message); the journal result is the agent's
             # actual return value, so it becomes the span output instead of "".
             empty_output_fallback=agent_result_json,
+            nesting=nesting,
         )
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, agent_end_timestamp)
     return latest_end_timestamp
@@ -2896,14 +3643,34 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
                                span_name: Optional[str] = None,
                                extra_metadata: Optional[Dict[str, Any]] = None,
                                generation_name: str = "Subagent LLM Call",
-                               empty_output_fallback: Optional[str] = None) -> Optional[datetime]:
+                               empty_output_fallback: Optional[str] = None,
+                               nesting: Optional[AgentNesting] = None,
+                               subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+                               ) -> Optional[datetime]:
+    """Emit one agent run as an agent observation, its own launches nested
+    under their tool spans at any depth.
+
+    All agents of a session share one flat subagents/ directory, so the
+    same tool_use-keyed map serves every level. The ancestry guard stops
+    cycles, MAX_AGENT_DEPTH stops runaway trees, and a missing or empty
+    transcript emits nothing.
+    """
+    nesting = nesting if nesting is not None else AgentNesting()
     path = subagent.get("path")
     if not isinstance(path, Path):
         return start_timestamp
-    rows = read_subagent_jsonl(path)
-    if rows is None:
+    agent_key = get_agent_key(subagent)
+    if agent_key in nesting.ancestry or nesting.depth >= MAX_AGENT_DEPTH:
+        info(f"agent {agent_key} not expanded: cycle or depth limit at depth {nesting.depth}")
+        return start_timestamp
+    all_rows = read_subagent_jsonl(path)
+    if all_rows is None:
         return start_timestamp
 
+    rows, run_index, run_end = select_agent_run_rows(subagent, all_rows)
+    # This agent's own SendMessage resumes of its children, registered before
+    # its launches are emitted so each launch is cut at its first resume.
+    register_agent_resumes(subagent_transcripts_by_tool_use_id, get_agent_resumes_from_rows(rows))
     turns = build_turns(rows)
     if not turns:
         return start_timestamp
@@ -2921,28 +3688,73 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
         # Classic subagents pass no fallback, keeping their behavior unchanged.
         subagent_output_text = empty_output_fallback
 
+    agent_type = subagent.get("agent_type")
     description = subagent.get("description")
     if span_name is None:
-        span_name = f"Subagent: {description}" if isinstance(description, str) and description else "Subagent"
+        span_name = get_subagent_observation_name(subagent, run_index)
+    depth = nesting.depth + 1
+    agent_id = subagent.get("agent_id")
+    identity: Dict[str, Any] = {
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "agent_depth": depth,
+    }
     subagent_metadata: Dict[str, Any] = {
-        "agent_type": subagent.get("agent_type"),
+        **identity,
         "description": description,
         "transcript_path": get_short_transcript_path_for_metadata(path),
         "user_text": subagent_input_meta,
     }
+    for key in ("spawn_depth", "parent_agent_id", "model", "name"):
+        if subagent.get(key) not in (None, ""):
+            subagent_metadata[key] = subagent[key]
+    if nesting.ancestry:
+        subagent_metadata["parent_agent_key"] = nesting.ancestry[-1]
+    if run_index:
+        subagent_metadata["resumed_run"] = run_index
+        subagent_metadata["launch_tool_use_id"] = subagent.get("launch_tool_use_id")
+
+    definition = resolve_agent_definition(agent_type, get_rows_cwd(all_rows))
+    definition_meta = agent_definition_metadata(definition)
+    if definition_meta:
+        subagent_metadata["agent_definition"] = definition_meta
+    session_context = nesting.session_context
+    context_rows = all_rows[:run_end]
+    agent_context = (
+        session_context.agent_context(agent_id if isinstance(agent_id, str) else None, context_rows)
+        if session_context is not None
+        else extract_agent_context(context_rows)
+    )
+    instruction_files = build_instruction_file_list(agent_context)
+    if instruction_files:
+        subagent_metadata["instruction_files"] = instruction_files
     if extra_metadata:
         subagent_metadata.update(extra_metadata)
     subagent_span = _start_backdated(
         langfuse,
         name=span_name,
-        as_type="span",
+        as_type="agent",
         start_time=subagent_start_timestamp,
         parent_otel_span=parent_otel_span,
         input={"role": "user", "content": subagent_input_text},
         metadata=subagent_metadata,
         **get_status_kwargs(get_worst_turn_status(turns)),
     )
+    emit_instructions_observation(
+        langfuse,
+        subagent_span._otel_span,
+        agent_type if isinstance(agent_type, str) else None,
+        agent_context,
+        definition,
+        subagent_start_timestamp,
+    )
 
+    child_nesting = AgentNesting(
+        depth=depth,
+        ancestry=nesting.ancestry + (agent_key,),
+        session_context=session_context,
+        scope_metadata=identity,
+    )
     latest_end_timestamp = subagent_start_timestamp
     previous_start_timestamp = subagent_start_timestamp
     # The agent transcript is complete on disk, so history accumulates
@@ -2955,8 +3767,9 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             turn,
             previous_start_timestamp,
             generation_name=generation_name,
-            subagent_transcripts_by_tool_use_id=None,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
             history_prefix=list(subagent_history),
+            nesting=child_nesting,
         )
         subagent_history.extend(build_turn_history_messages(turn))
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, latest_turn_timestamp)
@@ -3059,6 +3872,39 @@ def build_trace_metadata(
                 trace_metadata["project"] = Path(value).name
     return trace_metadata
 
+MAX_TRACE_METADATA_AGENTS = 50
+
+def build_main_agent_metadata(
+    main_agent: Optional[str],
+    definition: Optional[Dict[str, Any]],
+    context: AgentContext,
+    agent_runs: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+) -> Dict[str, Any]:
+    """Trace-level view of who worked on the turn and what the main agent
+    was told (file list only; contents live on the Instructions child)."""
+    metadata: Dict[str, Any] = {}
+    if main_agent:
+        metadata["main_agent"] = main_agent
+    definition_meta = agent_definition_metadata(definition)
+    if definition_meta:
+        metadata["main_agent_definition"] = definition_meta
+    instruction_files = build_instruction_file_list(context)
+    if instruction_files:
+        metadata["instruction_files"] = instruction_files
+    agents: List[Dict[str, Any]] = []
+    for subagent, _ in agent_runs[:MAX_TRACE_METADATA_AGENTS]:
+        agent = {
+            key: subagent.get(key)
+            for key in ("agent_id", "agent_type", "description", "spawn_depth", "parent_agent_id")
+            if subagent.get(key) not in (None, "")
+        }
+        if is_resumed_run_entry(subagent):
+            agent["resumed"] = True
+        agents.append(agent)
+    if agents:
+        metadata["subagents"] = agents
+    return metadata
+
 def is_valid_span_id_hex(span_id: Any) -> bool:
     return (
         isinstance(span_id, str)
@@ -3111,7 +3957,9 @@ def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
 
 def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
                         transcript_path: Path, trace_seed: Optional[str] = None,
-                        parent_context: Optional[Tuple[str, str]] = None) -> Any:
+                        parent_context: Optional[Tuple[str, str]] = None,
+                        main_agent: Optional[str] = None,
+                        extra_metadata: Optional[Dict[str, Any]] = None) -> Any:
     """Open the turn's root span, backdated to the user message.
 
     The root exports exactly once, at the first firing that is allowed to
@@ -3131,14 +3979,17 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
     # scannable; the conversation history lives on the LLM call inputs.
     root_input = {"role": "user", "content": build_user_history_content(turn.user_msg)}
     trace_metadata = build_trace_metadata(session_id, turn_num, turn, transcript_path, user_text_meta)
+    if extra_metadata:
+        trace_metadata.update(extra_metadata)
+    root_name = get_root_observation_name(main_agent)
     if parent_context is not None:
         parent_trace_id, parent_span_id = parent_context
         trace_metadata["parent_trace_id"] = parent_trace_id
         trace_metadata["parent_span_id"] = parent_span_id
         return _start_backdated(
             langfuse,
-            name="Conversational Turn",
-            as_type="span",
+            name=root_name,
+            as_type="agent",
             start_time=parse_timestamp(turn.user_msg),
             forced_trace_id=parent_trace_id,
             forced_parent_span_id=parent_span_id,
@@ -3156,8 +4007,8 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
             debug(f"trace id derivation failed for turn {turn_num}: {e}")
     return _start_backdated(
         langfuse,
-        name="Conversational Turn",
-        as_type="span",
+        name=root_name,
+        as_type="agent",
         start_time=parse_timestamp(turn.user_msg),
         parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
         forced_trace_id=forced_trace_id,
@@ -3193,7 +4044,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
               trace_seed: Optional[str] = None,
               parent_context: Optional[Tuple[str, str]] = None,
               workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
-              history_prefix: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+              history_prefix: Optional[List[Dict[str, Any]]] = None,
+              session_context: Optional[SessionContext] = None) -> Dict[str, Any]:
     """Emit a turn, resuming from prior firings' progress.
 
     With no progress and close=True this is the classic one-shot emission.
@@ -3211,12 +4063,14 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         emitted=set(k for k in (progress.get("emitted_keys") or []) if isinstance(k, str)),
         completed_only=not close,
     )
+    main_agent = session_context.main_agent_for_turn(turn) if session_context is not None else ""
+    agent_runs = list(iter_descendant_agent_runs(turn.assistant_msgs, subagent_transcripts_by_tool_use_id))
     if parent_context is None:
         attribute_propagation = propagate_attributes(
             session_id=session_id,
             user_id=user_id,
-            trace_name=TRACE_NAME,
-            tags=get_trace_tags(turn, subagent_transcripts_by_tool_use_id),
+            trace_name=get_trace_name(main_agent),
+            tags=get_trace_tags(turn, subagent_transcripts_by_tool_use_id, main_agent, agent_runs),
         )
     else:
         # Attached mode: trace name, session, user and tags are trace-level
@@ -3227,14 +4081,30 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         trace_span = None
         root_span_id = progress.get("root_span_id")
         if not is_valid_span_id_hex(root_span_id):
+            main_definition = resolve_agent_definition(
+                main_agent or DEFAULT_MAIN_AGENT, get_rows_cwd([turn.user_msg])
+            )
+            main_context = (
+                session_context.main_context_for_turn(turn)
+                if session_context is not None
+                else AgentContext()
+            )
             trace_span = open_turn_root_span(
                 langfuse, session_id, turn_num, turn, transcript_path,
                 trace_seed=trace_seed, parent_context=parent_context,
+                main_agent=main_agent,
+                extra_metadata=build_main_agent_metadata(
+                    main_agent, main_definition, main_context, agent_runs
+                ),
             )
             root_span_id = getattr(trace_span, "id", None)
             progress["root_span_id"] = root_span_id
             progress["trace_id"] = getattr(trace_span, "trace_id", None)
             parent_otel_span = trace_span._otel_span
+            emit_instructions_observation(
+                langfuse, parent_otel_span, main_agent or DEFAULT_MAIN_AGENT,
+                main_context, main_definition, parse_timestamp(turn.user_msg),
+            )
         else:
             # Root span exported by an earlier firing: attach children to it
             # via a carrier. The stored trace id wins over re-derivation so
@@ -3253,6 +4123,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
             cursor=cursor,
             workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
             history_prefix=history_prefix,
+            nesting=AgentNesting(session_context=session_context),
         )
         if trace_span is not None:
             # The root exports exactly once: end time and output are the
@@ -3287,6 +4158,7 @@ def emit_and_close_ready_turns(
     parent_context: Optional[Tuple[str, str]] = None,
     workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
     session_history: Optional[SessionHistory] = None,
+    session_context: Optional[SessionContext] = None,
 ) -> int:
     emitted = 0
     # Turns without a user-row uuid bypass assign_turn_numbers; seed their
@@ -3323,6 +4195,7 @@ def emit_and_close_ready_turns(
                     if session_history is not None
                     else None
                 ),
+                session_context=session_context,
             )
         except Exception as e:
             # Log at INFO so SDK incompatibilities (and other emit failures)
@@ -3344,6 +4217,7 @@ def emit_ready_observations_of_open_turn(
     parent_context: Optional[Tuple[str, str]] = None,
     workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
     session_history: Optional[SessionHistory] = None,
+    session_context: Optional[SessionContext] = None,
 ) -> None:
     """Emit the held open turn once its async activity is provably resolved.
 
@@ -3393,6 +4267,7 @@ def emit_ready_observations_of_open_turn(
                 if session_history is not None
                 else None
             ),
+            session_context=session_context,
         )
         session_state.turn_progress[user_row_uuid] = progress
     except Exception as e:
@@ -3405,6 +4280,7 @@ def emit_new_turns_from_transcript(
     transcript_path: Path,
     *,
     flush_deferred_agent_turns: bool = False,
+    payload_agent_type: Optional[str] = None,
 ) -> int:
     key = get_session_state_key(session_id, str(transcript_path))
 
@@ -3429,10 +4305,19 @@ def emit_new_turns_from_transcript(
 
         # One full-file pass per firing serves every turn emitted below.
         session_history = None
+        session_context = None
         if turns or session_state.open_turn:
+            full_rows = read_subagent_jsonl(transcript_path)
             session_history = build_session_history(
                 transcript_path,
                 get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
+                rows=full_rows,
+            )
+            session_context = build_session_context(
+                session_id, full_rows, session_state, payload_agent_type
+            )
+            register_agent_resumes(
+                subagent_transcripts_by_tool_use_id, session_context.index.resumes
             )
 
         emitted = 0
@@ -3454,6 +4339,7 @@ def emit_new_turns_from_transcript(
                 parent_context=config.parent_context,
                 workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
                 session_history=session_history,
+                session_context=session_context,
             )
 
         session_state.turn_count += emitted
@@ -3473,6 +4359,7 @@ def emit_new_turns_from_transcript(
             parent_context=config.parent_context,
             workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
             session_history=session_history,
+            session_context=session_context,
         )
 
         # Known limitation (accepted, like the crash-between-emit-and-save
@@ -3528,6 +4415,8 @@ def main() -> int:
 
     session_id, transcript_path = hook_context
     flush_deferred_agent_turns = is_session_end_hook_payload(payload)
+    if flush_deferred_agent_turns:
+        sweep_stale_context_files()
 
     langfuse = create_langfuse_client(config)
     if langfuse is None:
@@ -3540,6 +4429,7 @@ def main() -> int:
             session_id,
             transcript_path,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
+            payload_agent_type=get_main_agent_type_from_payload(payload),
         )
 
         dur = time.time() - start

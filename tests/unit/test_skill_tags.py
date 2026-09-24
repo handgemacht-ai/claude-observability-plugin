@@ -153,6 +153,7 @@ def test_subagent_skills_do_not_leak_into_main_skill_namespace(hook_module, tmp_
     assert hook_module.collect_skill_tags(turns[0]) == []
     assert hook_module.get_trace_tags(turns[0], sub_map) == [
         "claude-code",
+        "subagent:general-purpose",
         "subagent-skill:deep-research",
     ]
 

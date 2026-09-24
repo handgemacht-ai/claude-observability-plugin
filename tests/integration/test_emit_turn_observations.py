@@ -24,7 +24,7 @@ def test_emit_turn_observations_creates_generation_tool_and_subagent_observation
     names = [observation.name for observation in fake_langfuse.observations]
     assert "LLM Call" in names
     assert "Tool: Agent" in names
-    assert "Subagent: Summarize docs" in names
+    assert "Subagent: general-purpose · Summarize docs" in names
     assert "Subagent LLM Call" in names
     assert "Tool: ToolSearch" in names
     assert latest_end_timestamp.isoformat() == "2026-01-01T00:02:06+00:00"
@@ -34,7 +34,7 @@ def test_emit_turn_observations_creates_generation_tool_and_subagent_observation
     assert "Async agent launched successfully." in agent_tool.output
 
 
-def test_nested_subagents_document_current_non_recursive_emission_behavior(
+def test_nested_subagents_expand_under_the_launching_tool_span(
     hook_module,
     fixture_transcript_path,
     read_fixture_jsonl,
@@ -54,10 +54,16 @@ def test_nested_subagents_document_current_non_recursive_emission_behavior(
         subagent_transcripts_by_tool_use_id=subagents,
     )
 
-    names = [observation.name for observation in fake_langfuse.observations]
-    assert "Subagent: Outer agent" in names
-    assert "Tool: Agent" in names
-    assert "Subagent: Inner agent" not in names
+    by_name = {observation.name: observation for observation in fake_langfuse.observations}
+    outer = by_name["Subagent: general-purpose · Outer agent"]
+    inner = by_name["Subagent: fork · Inner agent"]
+    outer_tool, inner_tool = [o for o in fake_langfuse.observations if o.name == "Tool: Agent"]
+    assert outer._otel_span.parent is outer_tool._otel_span
+    assert inner_tool._otel_span.parent is outer._otel_span
+    assert inner._otel_span.parent is inner_tool._otel_span
+    assert (outer.as_type, inner.as_type) == ("agent", "agent")
+    assert inner.kwargs["metadata"]["agent_depth"] == 2
+    assert inner.kwargs["metadata"]["parent_agent_key"] == "outer-agent"
 
 
 # The fixture's human wait: the AskUserQuestion tool_use is written at

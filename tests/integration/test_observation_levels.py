@@ -199,7 +199,7 @@ def emit_subagent(hook_module, fake_langfuse, tmp_path, rows):
     return next(
         observation
         for observation in fake_langfuse.observations
-        if observation.name == "Subagent: Check things"
+        if observation.name == "Subagent: general-purpose · Check things"
     )
 
 

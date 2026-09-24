@@ -214,8 +214,8 @@ def test_named_teammate_transcript_attaches_to_its_launch_at_session_end_flush(
     names = [observation.name for observation in fake_langfuse.observations]
     assert "Conversational Turn" in names
     assert "Tool: Agent" in names
-    assert "Subagent: Build issue 4" in names
-    teammate_span = next(o for o in fake_langfuse.observations if o.name == "Subagent: Build issue 4")
+    assert "Subagent: builder-issue-4 · Build issue 4" in names
+    teammate_span = next(o for o in fake_langfuse.observations if o.name == "Subagent: builder-issue-4 · Build issue 4")
     # Real teammate metas set agentType to the teammate name (config/launch
     # result say "general-purpose"; the meta does not).
     assert teammate_span.kwargs["metadata"]["agent_type"] == "builder-issue-4"

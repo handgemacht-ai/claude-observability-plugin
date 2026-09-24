@@ -233,6 +233,10 @@ def _isolated_hook_env(tmp_path: Path, hook_module: Any, monkeypatch: pytest.Mon
     monkeypatch.setattr(hook_module, "STATE_FILE", state_dir / "langfuse_state.json")
     monkeypatch.setattr(hook_module, "LOCK_FILE", state_dir / "langfuse_state.lock")
     monkeypatch.setattr(hook_module, "LOG_FILE", state_dir / "langfuse_hook.log")
+    # Agent definitions resolve against the Claude config dir; keep the
+    # developer's real ~/.claude out of the tests.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    hook_module._AGENT_DEFINITION_CACHE.clear()
     _reset_hook_logger(hook_module)
     yield state_dir
     _reset_hook_logger(hook_module)
