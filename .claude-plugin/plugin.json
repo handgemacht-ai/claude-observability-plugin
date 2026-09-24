@@ -1,7 +1,7 @@
 {
   "name": "langfuse-observability",
   "description": "The Langfuse x Claude Code Observability Plugin",
-  "version": "1.2.0",
+  "version": "1.3.0-handgemacht.1",
   "author": {
     "name": "Langfuse"
   },
@@ -59,6 +59,18 @@
       "type": "boolean",
       "title": "Capture images",
       "description": "Upload images to Langfuse and show them in the trace. This includes pasted images and screenshots from tool results. Your Langfuse deployment must support media upload. Set to false to show short text markers instead.",
+      "default": true
+    },
+    "CC_LANGFUSE_CAPTURE_INSTRUCTIONS": {
+      "type": "boolean",
+      "title": "Capture instruction files",
+      "description": "Attach the instruction files each agent loaded (CLAUDE.md, rules, nested memory) with their contents to the trace. Set to false to send neither the file list nor the contents.",
+      "default": true
+    },
+    "CC_LANGFUSE_CAPTURE_SYSTEM_PROMPT": {
+      "type": "boolean",
+      "title": "Capture system prompts",
+      "description": "Attach each agent's system prompt (as Claude Code recorded it, else the agent definition file) to the trace.",
       "default": true
     },
     "CC_LANGFUSE_STATE_DIR": {
