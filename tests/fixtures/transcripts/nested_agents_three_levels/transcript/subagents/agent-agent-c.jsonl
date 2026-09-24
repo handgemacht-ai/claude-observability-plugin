@@ -1,0 +1,3 @@
+{"type":"user","timestamp":"2026-01-01T00:00:03.500Z","sessionId":"session-deep","agentId":"agent-c","uuid":"c-user-1","cwd":"/repo","isSidechain":true,"message":{"role":"user","content":"Look around"}}
+{"type":"attachment","timestamp":"2026-01-01T00:00:03.550Z","sessionId":"session-deep","agentId":"agent-c","uuid":"c-instructions","attachment":{"type":"instructions","files":[{"path":"/repo/CLAUDE.md","type":"Project","content":"Always be brief."}]}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:04.000Z","sessionId":"session-deep","agentId":"agent-c","uuid":"c-assistant-1","message":{"id":"msg-c-1","role":"assistant","model":"claude-test","content":[{"type":"text","text":"C result."}]}}
