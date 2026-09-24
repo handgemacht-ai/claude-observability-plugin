@@ -590,3 +590,83 @@ def test_held_workflow_turn_defers_the_run_directory_read_too(
         "Workflow agent: verify-claims/r2",
         "Workflow agent: verify-claims/r3",
     ]
+
+
+def test_agents_started_by_a_workflow_agent_nest_under_its_launching_tool_span(
+    hook_module,
+    fake_langfuse,
+    isolated_hook_state,
+    fixture_transcript_path,
+    tmp_path,
+):
+    transcript, rows = copy_workflow_fixture(fixture_transcript_path, tmp_path)
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+    agent_r1 = tmp_path / "transcript" / "subagents" / "workflows" / "wf_test001" / "agent-r1.jsonl"
+    r1_rows = [json.loads(line) for line in agent_r1.read_text(encoding="utf-8").splitlines() if line.strip()]
+    launch_rows = [
+        {"type": "assistant", "timestamp": "2026-07-23T10:00:50.000Z", "sessionId": "session-workflow",
+         "agentId": "r1", "uuid": "wf-r1-launch", "isSidechain": True,
+         "message": {"id": "msg-wf-r1-launch", "type": "message", "role": "assistant", "model": "claude-test",
+                     "content": [{"type": "tool_use", "id": "toolu_wf_child", "name": "Agent",
+                                  "input": {"description": "Deep dive", "prompt": "Check the source."}}],
+                     "usage": {"input_tokens": 1, "output_tokens": 1}}},
+        {"type": "user", "timestamp": "2026-07-23T10:01:10.000Z", "sessionId": "session-workflow",
+         "agentId": "r1", "uuid": "wf-r1-launch-result", "isSidechain": True,
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_wf_child", "content": "Source confirms A."}]}},
+    ]
+    agent_r1.write_text(
+        "\n".join(json.dumps(r) for r in r1_rows[:4] + launch_rows + r1_rows[4:]) + "\n", encoding="utf-8"
+    )
+    subagents_dir = tmp_path / "transcript" / "subagents"
+    (subagents_dir / "agent-child.meta.json").write_text(
+        json.dumps({"agentType": "Explore", "description": "Deep dive", "toolUseId": "toolu_wf_child",
+                    "spawnDepth": 2, "parentAgentId": "r1"}),
+        encoding="utf-8",
+    )
+    append_rows(subagents_dir / "agent-child.jsonl", [
+        {"type": "user", "timestamp": "2026-07-23T10:00:51.000Z", "sessionId": "session-workflow",
+         "agentId": "child", "uuid": "child-user-1", "isSidechain": True,
+         "message": {"role": "user", "content": "Check the source."}},
+        {"type": "assistant", "timestamp": "2026-07-23T10:01:05.000Z", "sessionId": "session-workflow",
+         "agentId": "child", "uuid": "child-assistant-1", "isSidechain": True,
+         "message": {"id": "msg-child-1", "type": "message", "role": "assistant", "model": "claude-test",
+                     "content": [{"type": "text", "text": "Source confirms A."}],
+                     "usage": {"input_tokens": 1, "output_tokens": 4}}},
+    ])
+
+    append_rows(transcript, rows)
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-workflow-child", transcript)
+
+    names = [o.name for o in fake_langfuse.observations]
+    assert names.count("Subagent: Explore · Deep dive") == 1
+    workflow_agent = next(o for o in fake_langfuse.observations if o.name == "Workflow agent: verify-claims/r1")
+    child = next(o for o in fake_langfuse.observations if o.name == "Subagent: Explore · Deep dive")
+    launch = next(
+        o for o in fake_langfuse.observations
+        if o.name == "Tool: Agent" and o._otel_span.parent is workflow_agent._otel_span
+    )
+    assert child._otel_span.parent is launch._otel_span
+    assert child.kwargs["metadata"]["agent_depth"] == 2
+    assert child.output == {"role": "assistant", "content": "Source confirms A."}
+
+
+def test_workflow_agents_of_a_named_agent_type_are_emitted(
+    hook_module,
+    fake_langfuse,
+    isolated_hook_state,
+    fixture_transcript_path,
+    tmp_path,
+):
+    transcript, rows = copy_workflow_fixture(fixture_transcript_path, tmp_path)
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+    meta = tmp_path / "transcript" / "subagents" / "workflows" / "wf_test001" / "agent-r2.meta.json"
+    meta.write_text(json.dumps({"agentType": "reviewer", "spawnDepth": 1}), encoding="utf-8")
+
+    append_rows(transcript, rows)
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-workflow-typed", transcript)
+
+    r2 = next(o for o in fake_langfuse.observations if o.name == "Workflow agent: verify-claims/r2")
+    assert r2.kwargs["metadata"]["agent_type"] == "reviewer"
+    tool_span = next(o for o in fake_langfuse.observations if o.name == "Tool: Workflow")
+    assert tool_span.kwargs["metadata"]["workflow_agent_count"] == 2

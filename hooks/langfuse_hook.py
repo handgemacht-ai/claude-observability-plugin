@@ -1801,11 +1801,11 @@ def get_workflow_agents_in_run_dir(run_dir: Path) -> List[Dict[str, Any]]:
     """The workflow-spawned agent transcripts of one Workflow run directory.
 
     Workflow-tool agents live under <stem>/subagents/workflows/<runId>/;
-    their meta.json carries agentType=="workflow-subagent" and — unlike
-    classic subagents — no toolUseId, so a run is identified by its directory
-    name instead. The launching tool_use is linked via toolUseResult.runId on
-    the parent transcript's tool_result row (see
-    get_workflow_launch_marker_from_row).
+    their meta.json carries agentType ("workflow-subagent", or the agent
+    type the workflow asked for) and — unlike classic subagents — no
+    toolUseId, so a run is identified by its directory name instead. The
+    launching tool_use is linked via toolUseResult.runId on the parent
+    transcript's tool_result row (see get_workflow_launch_marker_from_row).
     """
     if not run_dir.is_dir():
         return []
@@ -1817,7 +1817,7 @@ def get_workflow_agents_in_run_dir(run_dir: Path) -> List[Dict[str, Any]]:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if not isinstance(metadata, dict) or metadata.get("agentType") != "workflow-subagent":
+        if not isinstance(metadata, dict) or metadata.get("toolUseId"):
             continue
 
         resolved = resolve_agent_jsonl_and_id(meta_path)
@@ -3264,6 +3264,7 @@ def emit_single_tool_observation(
             cursor=cursor,
             emission_scope=tool_use_id or tool_key,
             nesting=nesting,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
         )
 
     # Exported spans are immutable, so the end time set here must already
@@ -3589,6 +3590,7 @@ def emit_workflow_agent_observations(
     cursor: EmissionCursor,
     emission_scope: str,
     nesting: Optional["AgentNesting"] = None,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[datetime]:
     """Emit each workflow-spawned agent transcript under the launching
     "Tool: Workflow" span.
@@ -3633,6 +3635,7 @@ def emit_workflow_agent_observations(
             # actual return value, so it becomes the span output instead of "".
             empty_output_fallback=agent_result_json,
             nesting=nesting,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
         )
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, agent_end_timestamp)
     return latest_end_timestamp

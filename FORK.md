@@ -40,6 +40,9 @@ to the other optional settings.
 - Every agent observation nests under the `Tool: Agent` (or `Task`) call that
   launched it, at any depth. A `SendMessage` call that resumes a stopped agent
   gets that run as `Subagent: … (resumed #n)`.
+- Agents that a Workflow run starts nest under its `Tool: Workflow` call as
+  `Workflow agent: <workflow>/<agent id>`, whatever agent type the workflow
+  gave them. Agents they start in turn nest under them like any other launch.
 - An agent launch span lasts until its agent is done, and ships together with
   the agent, also when the agent runs in the background.
 - Agent observations carry `agent_id`, `agent_type`, `agent_depth`,
