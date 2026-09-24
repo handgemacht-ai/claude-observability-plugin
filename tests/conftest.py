@@ -18,6 +18,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "transcripts"
 
+# The e2e run needs Claude Code and a live Langfuse; see tests/e2e/README.md.
+collect_ignore = ["e2e"]
+
 # Remove developer environment values that would leak into the hook's
 # import-time config. Tests that need these variables set them per test.
 os.environ.pop("CC_LANGFUSE_STATE_DIR", None)

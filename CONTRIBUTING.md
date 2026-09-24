@@ -14,6 +14,9 @@ Run the tests:
 uv run --group dev pytest
 ```
 
+[tests/e2e](tests/e2e/README.md) runs a real Claude Code session against a
+Langfuse instance and checks the trace. `pytest` does not run it.
+
 Lint with the same rules as CI:
 
 ```bash
