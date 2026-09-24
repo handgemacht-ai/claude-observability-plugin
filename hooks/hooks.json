@@ -19,6 +19,28 @@
           }
         ]
       }
+    ],
+    "InstructionsLoaded": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if command -v python3 >/dev/null 2>&1; then python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_context_hook.py; elif command -v uv >/dev/null 2>&1; then uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_context_hook.py; fi; exit 0",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if command -v python3 >/dev/null 2>&1; then python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_context_hook.py; elif command -v uv >/dev/null 2>&1; then uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_context_hook.py; fi; exit 0",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
