@@ -264,7 +264,8 @@ clean_repo() {
   done
   while IFS= read -r -d '' d; do
     run rm -rf "$d"
-  done < <(find "$REPO" -path "$REPO/.git" -prune -o -type d -name __pycache__ -prune -print0)
+  done < <(find "$REPO" \( -path "$REPO/.git" -o -path "$REPO/.worktrees" -o -path "$REPO/.venv" -o -path "$REPO/.pytest_cache" \) -prune \
+    -o -type d -name __pycache__ -prune -print0)
 
   leftover=$(git -C "$REPO" ls-files --others --ignored --exclude-standard --directory | without_junk)
   if [[ -n $leftover ]]; then
