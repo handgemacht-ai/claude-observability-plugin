@@ -1,5 +1,42 @@
 # Langfuse Observability Plugin for Claude Code
 
+## About This Fork
+
+This is a fork of
+[langfuse/Claude-Observability-Plugin](https://github.com/langfuse/Claude-Observability-Plugin).
+It keeps the plugin id `langfuse-observability@langfuse-observability` and its
+settings, and marks its versions with a `-handgemacht.N` suffix. It adds:
+
+- **Agents at any depth**: subagents, Workflow agents and resumed agents nest under the tool call that started them, also when a subagent starts them.
+- **Agent names and types**: the main agent and each subagent type show up in observation names, the trace name, tags and metadata, as Langfuse `agent` observations.
+- **Instructions capture**: each agent gets an `Instructions` child with its system prompt and the instruction files it loaded (opt out with `CC_LANGFUSE_CAPTURE_INSTRUCTIONS` and `CC_LANGFUSE_CAPTURE_SYSTEM_PROMPT`).
+- **Workflow agents that start agents**: their agents expand under them, and typed Workflow agents are kept.
+- **Late resumes**: a resumed agent's run is sent once, also when the resume shows up in a later turn.
+- **Hook time limits**: `Stop` keeps 600 seconds, `SessionEnd` is capped at 60 seconds, and the context hooks run in the background.
+- **Live end-to-end test**: [tests/e2e](tests/e2e/README.md) checks a real session's trace in Langfuse.
+
+[FORK.md](./FORK.md) covers the trace shape, the instructions capture and its
+settings, what is not captured, and the hook time limits.
+
+Install this checkout in place of the official plugin (user scope):
+
+```bash
+git clone https://github.com/handgemacht-ai/claude-observability-plugin.git
+cd claude-observability-plugin
+scripts/use-local-plugin.sh --dry-run   # show what would change
+scripts/use-local-plugin.sh             # install this checkout
+scripts/use-local-plugin.sh rollback    # back to the official release
+```
+
+The script backs up the Claude config first (under `~/.claude/backups/`, or
+`$CLAUDE_CONFIG_DIR/backups/`), keeps the plugin's settings, and removes
+`.venv`, `.pytest_cache`, `__pycache__` and `.worktrees/` from the checkout,
+because Claude Code copies the whole folder. Running sessions switch on
+restart. To update, pull and run the script again: Claude Code only reinstalls
+when `version` in `.claude-plugin/plugin.json` changes.
+
+## Overview
+
 Claude Code plugin that sends [Claude Code](https://claude.com/claude-code)
 session telemetry to [Langfuse](https://langfuse.com). It traces user prompts,
 agent turns, model generations with their token usage and cost, thinking blocks,

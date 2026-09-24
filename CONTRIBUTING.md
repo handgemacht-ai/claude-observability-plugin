@@ -45,6 +45,9 @@ Restart Claude Code afterwards, so that it loads the hook. Run
 `claude plugin marketplace remove langfuse-observability` when you are done, and
 add the GitHub marketplace again to go back to the released plugin.
 
+In this fork, `scripts/use-local-plugin.sh` does the switch and the way back
+with a config backup, see [About This Fork](./README.md#about-this-fork).
+
 ## Releasing
 
 1. From a clean, up-to-date `main` branch, raise `version` in
