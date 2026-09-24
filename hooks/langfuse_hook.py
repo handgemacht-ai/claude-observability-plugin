@@ -1991,6 +1991,24 @@ def find_resumed_run_start(rows: List[Dict[str, Any]], resume_start: datetime, s
             fallback = index
     return fallback if fallback is not None else len(rows)
 
+def firing_snapshot_time() -> datetime:
+    return datetime.now(timezone.utc)
+
+def rows_before_later_runs(rows: List[Dict[str, Any]], visible_until: Any) -> List[Dict[str, Any]]:
+    """Drop a run that started after the firing read the main transcript.
+
+    Its resume record may not have been in the rows the firing read, so the
+    known run before it would take it in. A later firing sees the record and
+    emits that run on its own.
+    """
+    if not isinstance(visible_until, datetime):
+        return rows
+    for index, row in enumerate(rows):
+        timestamp = parse_timestamp(row)
+        if timestamp is not None and _as_aware(timestamp) > visible_until and is_prompt_row(row):
+            return rows[:index]
+    return rows
+
 def select_agent_run_rows(
     subagent: Dict[str, Any],
     rows: List[Dict[str, Any]],
@@ -2001,6 +2019,7 @@ def select_agent_run_rows(
     the launch; run k is the k-th resume. The first row of a resumed run is
     the coordinator's isMeta message, promoted to the run's prompt.
     """
+    rows = rows_before_later_runs(rows, subagent.get("visible_until"))
     resume_starts = [s for s in (subagent.get("resume_starts") or []) if isinstance(s, datetime)]
     if not resume_starts:
         return rows, 0, len(rows)
@@ -4319,9 +4338,24 @@ def emit_new_turns_from_transcript(
             session_context = build_session_context(
                 session_id, full_rows, session_state, payload_agent_type
             )
+            visible_until = firing_snapshot_time()
+            for subagent in subagent_transcripts_by_tool_use_id.values():
+                subagent["visible_until"] = visible_until
             register_agent_resumes(
                 subagent_transcripts_by_tool_use_id, session_context.index.resumes
             )
+            # Agents also resume each other. Register those resumes for every
+            # turn of this firing before any turn ships, so an agent run in an
+            # earlier turn is cut where a later turn's agent resumed it.
+            held_rows = session_state.open_turn.get("rows") if isinstance(session_state.open_turn, dict) else None
+            firing_rows = [row for turn in turns for row in turn.assistant_msgs]
+            if isinstance(held_rows, list):
+                firing_rows += [row for row in held_rows if isinstance(row, dict)]
+            try:
+                for _ in iter_descendant_agent_runs(firing_rows, subagent_transcripts_by_tool_use_id):
+                    pass
+            except Exception as e:
+                debug(f"agent resume pre-scan failed: {type(e).__name__}: {e}")
 
         emitted = 0
         if turns:

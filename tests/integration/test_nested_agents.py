@@ -404,3 +404,116 @@ def test_a_resumed_agent_run_nests_under_its_send_message_call(hook_module, fake
     assert resumed_run.kwargs["metadata"]["resumed_run"] == 1
     assert resumed_run.kwargs["metadata"]["launch_tool_use_id"] == "toolu_x"
     assert resumed_run._otel_span.parent is by_name["Tool: SendMessage"]._otel_span
+
+
+def write_session(transcript: Path, rows: list[dict[str, Any]]) -> None:
+    transcript.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+
+def test_a_run_that_starts_after_the_firing_read_ships_once_later(
+    hook_module, fake_langfuse, tmp_path, monkeypatch
+):
+    transcript = tmp_path / "session-resume.jsonl"
+    first_turn = [
+        main_row("user", "u1", "2026-01-01T00:00:00.000Z", "Start X"),
+        main_row("assistant", "a1", "2026-01-01T00:00:01.000Z", tool_use("toolu_x", "Agent", {"description": "x"})),
+        main_row("user", "r1", "2026-01-01T00:00:05.000Z", tool_result("toolu_x", "X first."),
+                 toolUseResult={"status": "completed", "agentId": "x"}),
+        main_row("assistant", "a2", "2026-01-01T00:00:06.000Z", [{"type": "text", "text": "ok"}]),
+    ]
+    second_turn = [
+        main_row("user", "u2", "2026-01-01T00:01:00.000Z", "Ask X again"),
+        main_row("assistant", "a3", "2026-01-01T00:01:01.000Z",
+                 tool_use("toolu_send", "SendMessage", {"to": "x", "message": "again"})),
+        main_row("user", "r3", "2026-01-01T00:01:01.500Z", tool_result("toolu_send", "Agent resumed."),
+                 toolUseResult={"success": True, "resumedAgentId": "x"}),
+        main_row("assistant", "a4", "2026-01-01T00:01:02.000Z", [{"type": "text", "text": "waiting"}]),
+        main_row("user", "n1", "2026-01-01T00:01:10.000Z",
+                 "<task-notification><task-id>x</task-id><tool-use-id>toolu_send</tool-use-id>"
+                 "<result>X second.</result></task-notification>",
+                 origin={"kind": "task-notification"}),
+        main_row("assistant", "a5", "2026-01-01T00:01:11.000Z", [{"type": "text", "text": "X said second"}]),
+    ]
+    # The agent transcript already holds the resumed run, but the main
+    # transcript the firing read does not show the SendMessage call yet.
+    write_agent(tmp_path / "session-resume" / "subagents", "x", "toolu_x", [
+        main_row("user", "xu1", "2026-01-01T00:00:01.500Z", "go"),
+        main_row("assistant", "xa1", "2026-01-01T00:00:04.000Z", [{"type": "text", "text": "X first."}]),
+        main_row("user", "xc", "2026-01-01T00:01:02.000Z", "again", isMeta=True, origin={"kind": "coordinator"}),
+        main_row("assistant", "xa2", "2026-01-01T00:01:09.000Z", [{"type": "text", "text": "X second."}]),
+    ])
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+    snapshot = hook_module.parse_timestamp("2026-01-01T00:00:30.000Z")
+    monkeypatch.setattr(hook_module, "firing_snapshot_time", lambda: snapshot)
+
+    write_session(transcript, first_turn)
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-resume", transcript)
+
+    launch_run = next(o for o in fake_langfuse.observations if o.name == "Subagent: general-purpose · x")
+    assert launch_run.output == {"role": "assistant", "content": "X first."}
+
+    snapshot = hook_module.parse_timestamp("2026-01-01T00:02:00.000Z")
+    write_session(transcript, first_turn + second_turn)
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config, "session-resume", transcript, flush_deferred_agent_turns=True
+    )
+
+    names = [o.name for o in fake_langfuse.observations]
+    assert names.count("Subagent: general-purpose · x") == 1
+    assert names.count("Subagent: general-purpose · x (resumed #1)") == 1
+    x_generations = [
+        o for o in fake_langfuse.observations
+        if o.as_type == "generation" and o.kwargs["metadata"].get("agent_id") == "x"
+    ]
+    assert len(x_generations) == 2
+
+
+def test_an_agent_resumed_by_a_later_turns_agent_ships_each_run_once(hook_module, fake_langfuse, tmp_path):
+    transcript = tmp_path / "session-resume.jsonl"
+    write_session(transcript, [
+        main_row("user", "u1", "2026-01-01T00:00:00.000Z", "Start B"),
+        main_row("assistant", "a1", "2026-01-01T00:00:01.000Z", tool_use("toolu_b", "Agent", {"description": "b"})),
+        main_row("user", "r1", "2026-01-01T00:00:05.000Z", tool_result("toolu_b", "B first."),
+                 toolUseResult={"status": "completed", "agentId": "b"}),
+        main_row("assistant", "a2", "2026-01-01T00:00:06.000Z", [{"type": "text", "text": "ok"}]),
+        main_row("user", "u2", "2026-01-01T00:01:00.000Z", "Start A"),
+        main_row("assistant", "a3", "2026-01-01T00:01:01.000Z", tool_use("toolu_a", "Agent", {"description": "a"})),
+        main_row("user", "r3", "2026-01-01T00:01:20.000Z", tool_result("toolu_a", "A done."),
+                 toolUseResult={"status": "completed", "agentId": "a"}),
+        main_row("assistant", "a4", "2026-01-01T00:01:21.000Z", [{"type": "text", "text": "done"}]),
+    ])
+    subagents_dir = tmp_path / "session-resume" / "subagents"
+    write_agent(subagents_dir, "b", "toolu_b", [
+        main_row("user", "bu1", "2026-01-01T00:00:01.500Z", "go"),
+        main_row("assistant", "ba1", "2026-01-01T00:00:04.000Z", [{"type": "text", "text": "B first."}]),
+        main_row("user", "bc", "2026-01-01T00:01:03.000Z", "again", isMeta=True, origin={"kind": "coordinator"}),
+        main_row("assistant", "ba2", "2026-01-01T00:01:09.000Z", [{"type": "text", "text": "B second."}]),
+    ])
+    write_agent(subagents_dir, "a", "toolu_a", [
+        main_row("user", "au1", "2026-01-01T00:01:01.500Z", "go"),
+        main_row("assistant", "aa1", "2026-01-01T00:01:02.000Z",
+                 tool_use("toolu_a_send", "SendMessage", {"to": "b", "message": "again"})),
+        main_row("user", "ar1", "2026-01-01T00:01:02.500Z", tool_result("toolu_a_send", "Agent resumed."),
+                 toolUseResult={"success": True, "resumedAgentId": "b"}),
+        main_row("user", "an1", "2026-01-01T00:01:10.000Z",
+                 "<task-notification><task-id>b</task-id><tool-use-id>toolu_a_send</tool-use-id>"
+                 "<result>B second.</result></task-notification>",
+                 origin={"kind": "task-notification"}),
+        main_row("assistant", "aa2", "2026-01-01T00:01:19.000Z", [{"type": "text", "text": "A done."}]),
+    ])
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config, "session-resume", transcript, flush_deferred_agent_turns=True
+    )
+
+    names = [o.name for o in fake_langfuse.observations]
+    assert names.count("Subagent: general-purpose · b") == 1
+    assert names.count("Subagent: general-purpose · b (resumed #1)") == 1
+    launch_run = next(o for o in fake_langfuse.observations if o.name == "Subagent: general-purpose · b")
+    assert launch_run.output == {"role": "assistant", "content": "B first."}
+    b_generations = [
+        o for o in fake_langfuse.observations
+        if o.as_type == "generation" and o.kwargs["metadata"].get("agent_id") == "b"
+    ]
+    assert len(b_generations) == 2
