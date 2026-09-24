@@ -98,3 +98,20 @@ from the working directory), then `~/.claude/agents` (or
   unless it is written to the transcript.
 - Instruction file contents with `CC_LANGFUSE_CAPTURE_INSTRUCTIONS=false`, and
   system prompts with `CC_LANGFUSE_CAPTURE_SYSTEM_PROMPT=false`.
+
+## Hook Time Limits
+
+- The `Stop` hook may run for up to 600 seconds, Claude Code's default for
+  command hooks. Catching up on many turns can take close to a minute. The hook
+  records its progress only after it has handed every new turn to the SDK, so a
+  hook stopped earlier would send the same turns again on the next `Stop`.
+  A hook stopped after that point, while the SDK is still delivering, can lose
+  spans but never duplicates them.
+- Each turn is sent by its own `Stop` hook. The `SessionEnd` hook only sends
+  turns that were still waiting for background agents. Claude Code gives all
+  `SessionEnd` hooks 1.5 seconds in total, and a plugin's own `timeout` does
+  not extend that budget. To give it more time, set
+  `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` (for example `30000`); the plugin
+  caps its `SessionEnd` hook at 60 seconds.
+- The `InstructionsLoaded` and `SessionStart` hooks run in the background, so
+  they never hold up Claude.

@@ -5,7 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if command -v uv >/dev/null 2>&1; then exec uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; else exec python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; fi"
+            "command": "if command -v uv >/dev/null 2>&1; then exec uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; else exec python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; fi",
+            "timeout": 600
           }
         ]
       }
@@ -15,7 +16,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if command -v uv >/dev/null 2>&1; then exec uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; else exec python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; fi"
+            "command": "if command -v uv >/dev/null 2>&1; then exec uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; else exec python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; fi",
+            "timeout": 60
           }
         ]
       }
@@ -26,6 +28,7 @@
           {
             "type": "command",
             "command": "if command -v python3 >/dev/null 2>&1; then python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_context_hook.py; elif command -v uv >/dev/null 2>&1; then uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_context_hook.py; fi; exit 0",
+            "async": true,
             "timeout": 10
           }
         ]
@@ -37,6 +40,7 @@
           {
             "type": "command",
             "command": "if command -v python3 >/dev/null 2>&1; then python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_context_hook.py; elif command -v uv >/dev/null 2>&1; then uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_context_hook.py; fi; exit 0",
+            "async": true,
             "timeout": 10
           }
         ]
