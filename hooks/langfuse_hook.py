@@ -160,6 +160,9 @@ STATE_FILE = STATE_DIR / "langfuse_state.json"
 LOCK_FILE = STATE_DIR / "langfuse_state.lock"
 # Written by hooks/langfuse_context_hook.py (InstructionsLoaded, SessionStart).
 CONTEXT_DIR_NAME = "langfuse_context"
+# Shared by every plugin process of the machine, whatever state directory it
+# uses, so only one of them sends a trace's root.
+ROOT_CLAIM_DIR = Path.home() / ".claude" / "state" / "langfuse_root_claims"
 
 
 @dataclass
@@ -1301,22 +1304,24 @@ def add_interrupted_turn_row(row: Dict[str, Any], state: TurnAssemblyState) -> b
     state.current_rows.append(row)
     return True
 
-def ends_on_question_to_user(state: TurnAssemblyState) -> bool:
-    """Report whether the open turn stopped to ask the user something.
+def message_asks_user(message: Dict[str, Any]) -> bool:
+    """Report whether an assistant message stops to ask the user something.
 
-    That is the case when its last assistant message asks through the
-    AskUserQuestion tool, or has no tool call and its text ends with a
-    question mark (a "go?" checkpoint). A message that still has other tool
-    calls means the agent was working, not waiting.
+    That is the case when it asks through the AskUserQuestion tool, or has no
+    tool call and its text ends with a question mark (a "go?" checkpoint). A
+    message that still has other tool calls means the agent was working, not
+    waiting.
     """
-    if not state.assistant_message_ids:
-        return False
-    last_message = merge_assistant_rows(state.assistant_rows_by_message_id[state.assistant_message_ids[-1]])
-    content = get_content_from_row(last_message)
+    content = get_content_from_row(message)
     tool_names = [block.get("name") for block in get_tool_use_blocks(content)]
     if tool_names:
         return set(tool_names) == {ASK_USER_QUESTION_TOOL}
     return extract_text_from_content(content).rstrip().rstrip(QUESTION_CLOSING_CHARS).endswith("?")
+
+def ends_on_question_to_user(state: TurnAssemblyState) -> bool:
+    if not state.assistant_message_ids:
+        return False
+    return message_asks_user(merge_assistant_rows(state.assistant_rows_by_message_id[state.assistant_message_ids[-1]]))
 
 def add_follow_up_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
     """Keep a reply to a question in the turn that asked it."""
@@ -2489,15 +2494,16 @@ CONTEXT_FILE_MAX_AGE = timedelta(days=30)
 def sweep_stale_context_files(now: Optional[datetime] = None) -> None:
     """Drop InstructionsLoaded/SessionStart record files of long-gone sessions."""
     cutoff = ((now or datetime.now(timezone.utc)) - CONTEXT_FILE_MAX_AGE).timestamp()
-    try:
-        for path in (STATE_DIR / CONTEXT_DIR_NAME).glob("*.jsonl"):
-            try:
-                if path.stat().st_mtime < cutoff:
-                    path.unlink()
-            except OSError:
-                continue
-    except OSError:
-        return
+    for directory, pattern in ((STATE_DIR / CONTEXT_DIR_NAME, "*.jsonl"), (ROOT_CLAIM_DIR, "*.claim")):
+        try:
+            for path in directory.glob(pattern):
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except OSError:
+                    continue
+        except OSError:
+            continue
 
 def _record_before(record: Dict[str, Any], limit: Optional[datetime]) -> bool:
     if limit is None:
@@ -4026,12 +4032,89 @@ def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
         return None
 
 
+class _FixedSpanIdGenerator:
+    """Hands out one given span id; everything else comes from the real generator."""
+
+    def __init__(self, real: Any, span_id: int) -> None:
+        self._real = real
+        self._span_id = span_id
+
+    def generate_span_id(self) -> int:
+        return self._span_id
+
+    def generate_trace_id(self) -> int:
+        return self._real.generate_trace_id()
+
+    def is_trace_id_random(self) -> bool:
+        return self._real.is_trace_id_random()
+
+
+def can_force_span_id(langfuse: Langfuse) -> bool:
+    return hasattr(getattr(langfuse, "_otel_tracer", None), "id_generator")
+
+
+@contextlib.contextmanager
+def forced_next_span_id(langfuse: Langfuse, span_id_hex: Optional[str]) -> Iterator[None]:
+    """Make the next span started on the client's tracer carry this 16-hex id."""
+    if span_id_hex is None:
+        yield
+        return
+    tracer = langfuse._otel_tracer
+    real = tracer.id_generator
+    tracer.id_generator = _FixedSpanIdGenerator(real, int(span_id_hex, 16))
+    try:
+        yield
+    finally:
+        tracer.id_generator = real
+
+
+def claim_turn_root(trace_id: Optional[str]) -> bool:
+    """Take the one right to send this trace's root.
+
+    Plugin processes that read the same transcript through different state
+    directories each see the turn as new; the first to claim it sends the
+    root and the others leave it out. Fails open: when the claim cannot be
+    written, the root is sent.
+    """
+    if not trace_id:
+        return True
+    try:
+        ROOT_CLAIM_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        debug(f"root claim directory unusable, sending the root anyway: {e}")
+        return True
+    try:
+        os.close(os.open(ROOT_CLAIM_DIR / f"{trace_id}.claim", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        return False
+    except OSError as e:
+        debug(f"root claim for {trace_id} failed, sending the root anyway: {e}")
+    return True
+
+
+def turn_waits_for_user_reply(turn: Turn) -> bool:
+    return bool(turn.assistant_msgs) and message_asks_user(turn.assistant_msgs[-1])
+
+
+def end_turn_root(root_span: Any, turn: Turn, obs_end_ts: Optional[datetime]) -> None:
+    """Send the root with the output and end time known now; sent spans are immutable."""
+    if not claim_turn_root(getattr(root_span, "trace_id", None)):
+        info(f"root of trace {root_span.trace_id} already sent by another process; not sending a second")
+        return
+    root_span.update(output=build_turn_output_payload(turn))
+    root_span.end(end_time=to_otel_nanoseconds(get_root_span_end_time(turn, obs_end_ts)))
+
+
 def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
                         transcript_path: Path, trace_seed: Optional[str] = None,
                         parent_context: Optional[Tuple[str, str]] = None,
                         main_agent: Optional[str] = None,
-                        extra_metadata: Optional[Dict[str, Any]] = None) -> Any:
+                        extra_metadata: Optional[Dict[str, Any]] = None,
+                        reopen: Optional[Tuple[str, str]] = None) -> Any:
     """Open the turn's root span, backdated to the user message.
+
+    With reopen=(trace_id, span_id) the root of a turn whose earlier firing
+    held it back is made again under the ids its children already point at.
 
     The root exports exactly once, at the first firing that is allowed to
     emit the turn (async activity resolved, or turn closed); later firings
@@ -4053,41 +4136,44 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
     if extra_metadata:
         trace_metadata.update(extra_metadata)
     root_name = get_root_observation_name(main_agent)
+    reopen_trace_id, reopen_span_id = reopen if reopen else (None, None)
     if parent_context is not None:
         parent_trace_id, parent_span_id = parent_context
         trace_metadata["parent_trace_id"] = parent_trace_id
         trace_metadata["parent_span_id"] = parent_span_id
+        with forced_next_span_id(langfuse, reopen_span_id):
+            return _start_backdated(
+                langfuse,
+                name=root_name,
+                as_type="agent",
+                start_time=parse_timestamp(turn.user_msg),
+                forced_trace_id=parent_trace_id,
+                forced_parent_span_id=parent_span_id,
+                as_root=False,
+                input=root_input,
+                metadata=trace_metadata,
+                **get_status_kwargs(get_turn_status(turn)),
+            )
+    # Opt-in deterministic trace ids: fail open to the carrier-derived id.
+    forced_trace_id: Optional[str] = reopen_trace_id
+    if trace_seed and forced_trace_id is None:
+        try:
+            forced_trace_id = derive_turn_trace_id(trace_seed, turn_num)
+        except Exception as e:
+            debug(f"trace id derivation failed for turn {turn_num}: {e}")
+    with forced_next_span_id(langfuse, reopen_span_id):
         return _start_backdated(
             langfuse,
             name=root_name,
             as_type="agent",
             start_time=parse_timestamp(turn.user_msg),
-            forced_trace_id=parent_trace_id,
-            forced_parent_span_id=parent_span_id,
-            as_root=False,
+            parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
+            forced_trace_id=forced_trace_id,
+            as_root=True,
             input=root_input,
             metadata=trace_metadata,
             **get_status_kwargs(get_turn_status(turn)),
         )
-    # Opt-in deterministic trace ids: fail open to the carrier-derived id.
-    forced_trace_id: Optional[str] = None
-    if trace_seed:
-        try:
-            forced_trace_id = derive_turn_trace_id(trace_seed, turn_num)
-        except Exception as e:
-            debug(f"trace id derivation failed for turn {turn_num}: {e}")
-    return _start_backdated(
-        langfuse,
-        name=root_name,
-        as_type="agent",
-        start_time=parse_timestamp(turn.user_msg),
-        parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
-        forced_trace_id=forced_trace_id,
-        as_root=True,
-        input=root_input,
-        metadata=trace_metadata,
-        **get_status_kwargs(get_turn_status(turn)),
-    )
 
 
 
@@ -4196,13 +4282,38 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
             history_prefix=history_prefix,
             nesting=AgentNesting(session_context=session_context),
         )
-        if trace_span is not None:
+        root_waits_for_reply = (
+            not close and turn_waits_for_user_reply(turn) and can_force_span_id(langfuse)
+        )
+        if trace_span is not None and root_waits_for_reply:
+            # The agent stopped on a question: the request may go on after
+            # the reply, so the root is held back (never ended, never sent)
+            # and made again with these ids once the request really ends.
+            progress["root_pending"] = True
+        elif trace_span is not None:
             # The root exports exactly once: end time and output are the
             # values known now, and stay — exported fields are immutable.
-            trace_span.update(output=build_turn_output_payload(turn))
-            trace_span.end(
-                end_time=to_otel_nanoseconds(get_root_span_end_time(turn, obs_end_ts))
+            end_turn_root(trace_span, turn, obs_end_ts)
+        elif progress.get("root_pending") and not root_waits_for_reply:
+            held_definition = resolve_agent_definition(
+                main_agent or DEFAULT_MAIN_AGENT, get_rows_cwd([turn.user_msg])
             )
+            held_context = (
+                session_context.main_context_for_turn(turn)
+                if session_context is not None
+                else AgentContext()
+            )
+            held_root = open_turn_root_span(
+                langfuse, session_id, turn_num, turn, transcript_path,
+                trace_seed=trace_seed, parent_context=parent_context,
+                main_agent=main_agent,
+                extra_metadata=build_main_agent_metadata(
+                    main_agent, held_definition, held_context, agent_runs
+                ),
+                reopen=(progress["trace_id"], root_span_id),
+            )
+            end_turn_root(held_root, turn, obs_end_ts)
+            progress["root_pending"] = False
     progress["emitted_keys"] = sorted(cursor.emitted)
     return progress
 

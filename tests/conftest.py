@@ -146,26 +146,47 @@ def read_fixture_jsonl() -> Any:
     return read_jsonl
 
 
+_fake_span_ids = itertools.count(1)
+
+
+class SequentialIdGenerator:
+    def generate_span_id(self) -> int:
+        return next(_fake_span_ids)
+
+    def generate_trace_id(self) -> int:
+        return next(_fake_span_ids)
+
+    def is_trace_id_random(self) -> bool:
+        return False
+
+
 class FakeOtelSpan:
-    def __init__(self, name: str, start_time: int | None, context: Any = None) -> None:
+    def __init__(self, name: str, start_time: int | None, span_id: int, context: Any = None) -> None:
         self.name = name
+        self.span_id = span_id
         self.start_time = start_time
         self.context = context
         self.attributes: dict[str, Any] = {}
         # The span this one was started under (via the stubbed use_span);
         # None for roots and carrier-context spans.
         self.parent = _ACTIVE_SPAN_STACK[-1] if _ACTIVE_SPAN_STACK else None
+        # Like OTel: a span joins the trace of the span or carrier it starts under.
+        carrier = self.parent or (context or {}).get("current_span")
+        self.trace_id = carrier.get_span_context().trace_id if carrier is not None else span_id
+
+    def get_span_context(self) -> Any:
+        return types.SimpleNamespace(trace_id=self.trace_id, span_id=self.span_id)
 
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
 
 
 class FakeTracer:
+    def __init__(self) -> None:
+        self.id_generator: Any = SequentialIdGenerator()
+
     def start_span(self, *, name: str, start_time: int | None = None, context: Any = None) -> FakeOtelSpan:
-        return FakeOtelSpan(name, start_time, context)
-
-
-_fake_observation_counter = itertools.count(1)
+        return FakeOtelSpan(name, start_time, self.id_generator.generate_span_id(), context)
 
 
 class FakeObservation:
@@ -177,9 +198,8 @@ class FakeObservation:
         self.output: Any = None
         self.end_time: int | None = None
         # Mirror the SDK's hex id/trace_id attributes (span.py sets both).
-        n = next(_fake_observation_counter)
-        self.id = f"{n:016x}"
-        self.trace_id = f"{n:032x}"
+        self.id = f"{otel_span.span_id:016x}"
+        self.trace_id = f"{otel_span.trace_id:032x}"
 
     def update(self, **kwargs: Any) -> None:
         if "output" in kwargs:
@@ -236,6 +256,7 @@ def _isolated_hook_env(tmp_path: Path, hook_module: Any, monkeypatch: pytest.Mon
     monkeypatch.setattr(hook_module, "STATE_FILE", state_dir / "langfuse_state.json")
     monkeypatch.setattr(hook_module, "LOCK_FILE", state_dir / "langfuse_state.lock")
     monkeypatch.setattr(hook_module, "LOG_FILE", state_dir / "langfuse_hook.log")
+    monkeypatch.setattr(hook_module, "ROOT_CLAIM_DIR", tmp_path / "root-claims")
     # Agent definitions resolve against the Claude config dir; keep the
     # developer's real ~/.claude out of the tests.
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
