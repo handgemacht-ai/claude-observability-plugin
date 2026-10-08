@@ -54,6 +54,9 @@ MAX_OPERATOR_TAG_CHARS = 200
 # Bound for unresolved task notifications kept in the state file between runs.
 MAX_PENDING_TASK_NOTIFICATIONS = 50
 INTERRUPTED_TURN_MARKER = "[Request interrupted by user]"
+ASK_USER_QUESTION_TOOL = "AskUserQuestion"
+# Markdown and quote characters that may follow the question mark of a closing question.
+QUESTION_CLOSING_CHARS = " \t\n*_`\"')\u201d\u2019"
 # Claude Code caps spawn depth far lower; this only bounds corrupt data.
 MAX_AGENT_DEPTH = 32
 
@@ -948,6 +951,9 @@ class Turn:
     # belongs to, taken from isMeta rows carrying sourceToolUseID.
     injected_by_tool_id: Dict[str, str]
     rows: List[Dict[str, Any]]
+    # Replies typed after the agent stopped on a question, each with the index
+    # of the assistant message that answered it. They continue this turn.
+    follow_ups: List[Tuple[int, Dict[str, Any]]] = field(default_factory=list)
 
 @dataclass
 class TurnAssemblyState:
@@ -958,6 +964,7 @@ class TurnAssemblyState:
     tool_use_timestamps_by_id: Dict[str, Any] = field(default_factory=dict)
     injected_by_tool_id: Dict[str, str] = field(default_factory=dict)
     current_rows: List[Dict[str, Any]] = field(default_factory=list)
+    follow_ups: List[Tuple[int, Dict[str, Any]]] = field(default_factory=list)
 
 
 def _extract_xml_tag_value(text: str, tag: str) -> Optional[str]:
@@ -1294,6 +1301,31 @@ def add_interrupted_turn_row(row: Dict[str, Any], state: TurnAssemblyState) -> b
     state.current_rows.append(row)
     return True
 
+def ends_on_question_to_user(state: TurnAssemblyState) -> bool:
+    """Report whether the open turn stopped to ask the user something.
+
+    That is the case when its last assistant message asks through the
+    AskUserQuestion tool, or has no tool call and its text ends with a
+    question mark (a "go?" checkpoint). A message that still has other tool
+    calls means the agent was working, not waiting.
+    """
+    if not state.assistant_message_ids:
+        return False
+    last_message = merge_assistant_rows(state.assistant_rows_by_message_id[state.assistant_message_ids[-1]])
+    content = get_content_from_row(last_message)
+    tool_names = [block.get("name") for block in get_tool_use_blocks(content)]
+    if tool_names:
+        return set(tool_names) == {ASK_USER_QUESTION_TOOL}
+    return extract_text_from_content(content).rstrip().rstrip(QUESTION_CLOSING_CHARS).endswith("?")
+
+def add_follow_up_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
+    """Keep a reply to a question in the turn that asked it."""
+    if state.current_turn_user_row is None or not ends_on_question_to_user(state):
+        return False
+    state.current_rows.append(row)
+    state.follow_ups.append((len(state.assistant_message_ids), row))
+    return True
+
 def add_tool_result_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
     # tool_result rows show up as role=user with content blocks of type tool_result.
     if not is_tool_result(row):
@@ -1419,6 +1451,7 @@ def build_turn_from_state(state: TurnAssemblyState) -> Optional[Turn]:
         tool_use_timestamps_by_id=dict(state.tool_use_timestamps_by_id),
         injected_by_tool_id=dict(state.injected_by_tool_id),
         rows=list(state.current_rows),
+        follow_ups=list(state.follow_ups),
     )
 
 def start_new_turn(row: Dict[str, Any], state: TurnAssemblyState) -> None:
@@ -1429,6 +1462,7 @@ def start_new_turn(row: Dict[str, Any], state: TurnAssemblyState) -> None:
     state.tool_use_timestamps_by_id = {}
     state.injected_by_tool_id = {}
     state.current_rows = [row]
+    state.follow_ups = []
 
 
 def add_assistant_row(row: Dict[str, Any], state: TurnAssemblyState) -> None:
@@ -1482,6 +1516,9 @@ def assemble_turns(
             continue
 
         role = get_user_or_assistant_role_from_row(row)
+
+        if role == "user" and add_follow_up_row(row, state):
+            continue
 
         if role == "user":
             turn = build_turn_from_state(state)
@@ -2936,6 +2973,15 @@ def build_user_history_content(user_row: Dict[str, Any]) -> Any:
     return [user_text, *user_media] if user_media else user_text
 
 
+def build_follow_up_history_messages(turn: Turn, assistant_index: int) -> List[Dict[str, Any]]:
+    """The replies to a question that the assistant message at this index answers."""
+    return [
+        {"role": "user", "content": build_user_history_content(row)}
+        for answered_index, row in turn.follow_ups
+        if answered_index == assistant_index
+    ]
+
+
 def build_turn_history_messages(turn: Turn) -> List[Dict[str, Any]]:
     """The ChatML view of one turn, in the shape of the live generation payloads.
 
@@ -2946,7 +2992,8 @@ def build_turn_history_messages(turn: Turn) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = [
         {"role": "user", "content": build_user_history_content(turn.user_msg)}
     ]
-    for assistant_message in turn.assistant_msgs:
+    for assistant_index, assistant_message in enumerate(turn.assistant_msgs):
+        messages.extend(build_follow_up_history_messages(turn, assistant_index))
         assistant_text, _ = truncate_text(
             extract_text_from_content(get_content_from_row(assistant_message))
         )
@@ -3500,6 +3547,8 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             )
             previous_timestamp = _get_latest_timestamp(previous_timestamp, ready_async_result_timestamp)
 
+        if history_messages is not None:
+            history_messages.extend(build_follow_up_history_messages(turn, assistant_index))
         if history_messages is not None and ready_async_tool_results:
             history_messages.append({
                 "role": "tool",
