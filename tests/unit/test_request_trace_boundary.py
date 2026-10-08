@@ -165,6 +165,16 @@ def named(fake_langfuse: Any, name: str) -> list[Any]:
     return [observation for observation in fake_langfuse.observations if observation.name == name]
 
 
+def sent_roots(fake_langfuse: Any) -> list[Any]:
+    return [root for root in named(fake_langfuse, "Conversational Turn") if root.end_time is not None]
+
+
+def hook_firing(hook_module: Any, fake_langfuse: Any, transcript: Path, rows: list[dict[str, Any]], **options: Any) -> None:
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+    write_transcript(transcript, rows)
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, transcript, **options)
+
+
 def test_one_root_and_one_trace_for_a_question_stop_and_its_reply(
     hook_module, fake_langfuse, isolated_hook_state, tmp_path
 ):
@@ -181,5 +191,72 @@ def test_one_root_and_one_trace_for_a_question_stop_and_its_reply(
     hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, transcript)
     hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, transcript, flush_deferred_agent_turns=True)
 
-    assert len(named(fake_langfuse, "Conversational Turn")) == 1
+    assert len(sent_roots(fake_langfuse)) == 1
     assert len(named(fake_langfuse, "LLM Call")) == 2
+
+
+def test_root_is_sent_with_the_final_answer_and_the_last_stop_after_a_question_stop(
+    hook_module, fake_langfuse, tmp_path
+):
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    question_stop = [user_row("u1", 0, "Build the feature."), assistant_row("a1", 1, [text("Go?")])]
+    final_answer = assistant_row("a2", 3, [text("Built.")])
+
+    hook_firing(hook_module, fake_langfuse, transcript, question_stop)
+    sent_after_question = sent_roots(fake_langfuse)
+    hook_firing(hook_module, fake_langfuse, transcript, question_stop + [user_row("u2", 2, "yes"), final_answer])
+
+    [root] = sent_roots(fake_langfuse)
+    assert sent_after_question == []
+    assert root.output == {"role": "assistant", "content": "Built."}
+    assert root.end_time == hook_module.to_otel_nanoseconds(hook_module.parse_timestamp(final_answer))
+
+
+def test_sent_root_keeps_the_id_and_trace_the_children_point_at(hook_module, fake_langfuse, tmp_path):
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    question_stop = [user_row("u1", 0, "Build the feature."), assistant_row("a1", 1, [text("Go?")])]
+
+    hook_firing(hook_module, fake_langfuse, transcript, question_stop)
+    [held_root] = named(fake_langfuse, "Conversational Turn")
+    hook_firing(
+        hook_module, fake_langfuse, transcript,
+        question_stop + [user_row("u2", 2, "yes"), assistant_row("a2", 3, [text("Built.")])],
+    )
+
+    [root] = sent_roots(fake_langfuse)
+    assert (root.id, root.trace_id) == (held_root.id, held_root.trace_id)
+
+
+def test_unanswered_question_sends_the_root_when_the_session_ends(hook_module, fake_langfuse, tmp_path):
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    question_stop = [user_row("u1", 0, "Build the feature."), assistant_row("a1", 1, [text("Go?")])]
+
+    hook_firing(hook_module, fake_langfuse, transcript, question_stop)
+    hook_firing(hook_module, fake_langfuse, transcript, question_stop, flush_deferred_agent_turns=True)
+
+    [root] = sent_roots(fake_langfuse)
+    assert root.output == {"role": "assistant", "content": "Go?"}
+
+
+def test_second_process_without_the_first_one_s_state_does_not_send_a_second_root(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path
+):
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    rows = [user_row("u1", 0, "Build the feature."), assistant_row("a1", 1, [text("Built.")])]
+
+    hook_firing(hook_module, fake_langfuse, transcript, rows)
+    (isolated_hook_state / "langfuse_state.json").unlink()
+    hook_firing(hook_module, fake_langfuse, transcript, rows)
+
+    assert len(sent_roots(fake_langfuse)) == 1
+
+
+def test_root_goes_out_when_the_claim_cannot_be_written(hook_module, fake_langfuse, tmp_path, monkeypatch):
+    claim_dir_that_is_a_file = tmp_path / "not-a-directory"
+    claim_dir_that_is_a_file.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "ROOT_CLAIM_DIR", claim_dir_that_is_a_file)
+    transcript = tmp_path / f"{SESSION}.jsonl"
+
+    hook_firing(hook_module, fake_langfuse, transcript, [user_row("u1", 0, "Hi."), assistant_row("a1", 1, [text("Hello.")])])
+
+    assert len(sent_roots(fake_langfuse)) == 1

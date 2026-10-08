@@ -14,7 +14,14 @@ Everything else works as described in the [README](./README.md).
   agent stopped on a question to the user (the `AskUserQuestion` tool, or a
   closing message that ends with a question mark such as "go?"). Any other
   message, including one typed while the agent works, starts a new trace. The
-  reply shows up in the generation inputs after the question.
+  reply shows up in the generation inputs after the question. The root
+  observation is sent when the request really ends, so after a question stop and
+  a reply it shows the final answer and the last stop's end time; a request that
+  ends on a question sends its root when the session ends.
+- **One root per trace**: the first plugin process to send a trace's root leaves
+  a claim file in `~/.claude/state/langfuse_root_claims`; any other process that
+  reads the same transcript (for example through a different state directory)
+  skips the root.
 - **Instructions and system prompts**: each agent carries an `Instructions`
   child with its system prompt and the instruction files it loaded.
 
