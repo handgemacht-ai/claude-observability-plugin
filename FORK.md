@@ -10,6 +10,11 @@ Everything else works as described in the [README](./README.md).
   subagents start themselves.
 - **Agent names**: the main agent (`--agent` or the `agent` setting) and each
   subagent type show up in observation names, the trace name, tags and metadata.
+- **One trace per request**: a message continues the current trace when the
+  agent stopped on a question to the user (the `AskUserQuestion` tool, or a
+  closing message that ends with a question mark such as "go?"). Any other
+  message, including one typed while the agent works, starts a new trace. The
+  reply shows up in the generation inputs after the question.
 - **Instructions and system prompts**: each agent carries an `Instructions`
   child with its system prompt and the instruction files it loaded.
 
