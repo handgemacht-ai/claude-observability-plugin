@@ -1,0 +1,521 @@
+{
+ "formula": "span_id = sha256(f\"{trace_id}:{step_id}\").hexdigest()[:16]; step_id is 'root' for the root, the assistant message id for an LLM call, the tool_use_id for a tool step (edits included); an all-zero result becomes 0000000000000001. trace_id = sha256(f\"{session_id}:{first_user_uuid}\").hexdigest()[:32] where first_user_uuid is the uuid of the message that started the request.",
+ "cases": [
+  {
+   "name": "edit_in_one_stop",
+   "description": "A read and an edit, then a closing message, sent in one Stop",
+   "session_id": "session-fixture-edit",
+   "first_user_uuid": "u1",
+   "firings": [
+    [
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:00.000Z",
+      "sessionId": "session-fixture-edit",
+      "uuid": "u1",
+      "message": {
+       "role": "user",
+       "content": "Fix the typo in README."
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:01.000Z",
+      "sessionId": "session-fixture-edit",
+      "uuid": "a1",
+      "message": {
+       "id": "msg_edit_1",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "text",
+         "text": "Reading."
+        },
+        {
+         "type": "tool_use",
+         "id": "toolu_read_1",
+         "name": "Read",
+         "input": {
+          "file_path": "README.md"
+         }
+        }
+       ]
+      }
+     },
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:02.000Z",
+      "sessionId": "session-fixture-edit",
+      "uuid": "r1",
+      "message": {
+       "role": "user",
+       "content": [
+        {
+         "type": "tool_result",
+         "tool_use_id": "toolu_read_1",
+         "content": "# Exampel"
+        }
+       ]
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:03.000Z",
+      "sessionId": "session-fixture-edit",
+      "uuid": "a2",
+      "message": {
+       "id": "msg_edit_2",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "tool_use",
+         "id": "toolu_edit_1",
+         "name": "Edit",
+         "input": {
+          "file_path": "README.md",
+          "old_string": "Exampel",
+          "new_string": "Example"
+         }
+        }
+       ]
+      }
+     },
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:04.000Z",
+      "sessionId": "session-fixture-edit",
+      "uuid": "r2",
+      "message": {
+       "role": "user",
+       "content": [
+        {
+         "type": "tool_result",
+         "tool_use_id": "toolu_edit_1",
+         "content": "ok"
+        }
+       ]
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:05.000Z",
+      "sessionId": "session-fixture-edit",
+      "uuid": "a3",
+      "message": {
+       "id": "msg_edit_3",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "text",
+         "text": "Fixed."
+        }
+       ]
+      }
+     }
+    ]
+   ],
+   "subagents": {},
+   "trace_id": "dc607151c53074bdf6500940a8598e23",
+   "root_span_id": "a8b04d2e69ff731b",
+   "llm_calls": {
+    "msg_edit_1": "803c4208ef91765c",
+    "msg_edit_2": "a60844d990c92ba0",
+    "msg_edit_3": "e13dfc1adbbcf79d"
+   },
+   "tools": {
+    "toolu_read_1": "849d3dc0116ccebd",
+    "toolu_edit_1": "66708815d319d515"
+   }
+  },
+  {
+   "name": "question_stop_then_yes",
+   "description": "The agent stops on a question; the reply and the edit after it come in a second Stop and stay in the first message's trace",
+   "session_id": "session-fixture-question",
+   "first_user_uuid": "u1",
+   "firings": [
+    [
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:00.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "u1",
+      "message": {
+       "role": "user",
+       "content": "Build the feature."
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:01.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "a1",
+      "message": {
+       "id": "msg_q_1",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "tool_use",
+         "id": "toolu_read_q",
+         "name": "Read",
+         "input": {
+          "file_path": "plan.md"
+         }
+        }
+       ]
+      }
+     },
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:02.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "r1",
+      "message": {
+       "role": "user",
+       "content": [
+        {
+         "type": "tool_result",
+         "tool_use_id": "toolu_read_q",
+         "content": "plan"
+        }
+       ]
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:03.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "a2",
+      "message": {
+       "id": "msg_q_2",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "text",
+         "text": "Go?"
+        }
+       ]
+      }
+     }
+    ],
+    [
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:00.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "u1",
+      "message": {
+       "role": "user",
+       "content": "Build the feature."
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:01.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "a1",
+      "message": {
+       "id": "msg_q_1",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "tool_use",
+         "id": "toolu_read_q",
+         "name": "Read",
+         "input": {
+          "file_path": "plan.md"
+         }
+        }
+       ]
+      }
+     },
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:02.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "r1",
+      "message": {
+       "role": "user",
+       "content": [
+        {
+         "type": "tool_result",
+         "tool_use_id": "toolu_read_q",
+         "content": "plan"
+        }
+       ]
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:03.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "a2",
+      "message": {
+       "id": "msg_q_2",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "text",
+         "text": "Go?"
+        }
+       ]
+      }
+     },
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:04.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "u2",
+      "message": {
+       "role": "user",
+       "content": "yes"
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:05.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "a3",
+      "message": {
+       "id": "msg_q_3",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "tool_use",
+         "id": "toolu_edit_q",
+         "name": "Edit",
+         "input": {
+          "file_path": "a.py",
+          "old_string": "a",
+          "new_string": "b"
+         }
+        }
+       ]
+      }
+     },
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:06.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "r3",
+      "message": {
+       "role": "user",
+       "content": [
+        {
+         "type": "tool_result",
+         "tool_use_id": "toolu_edit_q",
+         "content": "ok"
+        }
+       ]
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:07.000Z",
+      "sessionId": "session-fixture-question",
+      "uuid": "a4",
+      "message": {
+       "id": "msg_q_4",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "text",
+         "text": "Built."
+        }
+       ]
+      }
+     }
+    ]
+   ],
+   "subagents": {},
+   "trace_id": "551febcfe5bdf5e4d874d1c169e9154b",
+   "root_span_id": "1b096fc05983c3c0",
+   "llm_calls": {
+    "msg_q_1": "0dc4cd8fc8e98396",
+    "msg_q_2": "ad57db16fff770f4",
+    "msg_q_3": "e440e5bc51bd6784",
+    "msg_q_4": "1dd485680564ab10"
+   },
+   "tools": {
+    "toolu_read_q": "7093821fcc5304fc",
+    "toolu_edit_q": "9e67b8fdf067a251"
+   }
+  },
+  {
+   "name": "subagent_under_tool_agent",
+   "description": "A subagent run under Tool: Agent; its LLM calls and tools get ids by the same rule",
+   "session_id": "session-fixture-agent",
+   "first_user_uuid": "u1",
+   "firings": [
+    [
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:00.000Z",
+      "sessionId": "session-fixture-agent",
+      "uuid": "u1",
+      "message": {
+       "role": "user",
+       "content": "Check for TODOs."
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:01.000Z",
+      "sessionId": "session-fixture-agent",
+      "uuid": "a1",
+      "message": {
+       "id": "msg_agent_1",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "tool_use",
+         "id": "toolu_agent_1",
+         "name": "Agent",
+         "input": {
+          "description": "TODO hunt",
+          "prompt": "Look for TODOs.",
+          "subagent_type": "general-purpose"
+         }
+        }
+       ]
+      }
+     },
+     {
+      "type": "user",
+      "timestamp": "2026-01-01T00:00:06.000Z",
+      "sessionId": "session-fixture-agent",
+      "uuid": "r1",
+      "message": {
+       "role": "user",
+       "content": [
+        {
+         "type": "tool_result",
+         "tool_use_id": "toolu_agent_1",
+         "content": "No TODOs."
+        }
+       ]
+      }
+     },
+     {
+      "type": "assistant",
+      "timestamp": "2026-01-01T00:00:07.000Z",
+      "sessionId": "session-fixture-agent",
+      "uuid": "a2",
+      "message": {
+       "id": "msg_agent_2",
+       "role": "assistant",
+       "model": "claude-test",
+       "content": [
+        {
+         "type": "text",
+         "text": "None found."
+        }
+       ]
+      }
+     }
+    ]
+   ],
+   "subagents": {
+    "agent-helper-1": {
+     "meta": {
+      "agentType": "general-purpose",
+      "description": "TODO hunt",
+      "toolUseId": "toolu_agent_1",
+      "spawnDepth": 1
+     },
+     "rows": [
+      {
+       "type": "user",
+       "timestamp": "2026-01-01T00:00:02.000Z",
+       "sessionId": "session-fixture-agent",
+       "agentId": "helper-1",
+       "uuid": "su1",
+       "message": {
+        "role": "user",
+        "content": "Look for TODOs."
+       }
+      },
+      {
+       "type": "assistant",
+       "timestamp": "2026-01-01T00:00:03.000Z",
+       "sessionId": "session-fixture-agent",
+       "uuid": "sa1",
+       "agentId": "helper-1",
+       "message": {
+        "id": "msg_sub_1",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [
+         {
+          "type": "tool_use",
+          "id": "toolu_sub_grep",
+          "name": "Grep",
+          "input": {
+           "pattern": "TODO"
+          }
+         }
+        ]
+       }
+      },
+      {
+       "type": "user",
+       "timestamp": "2026-01-01T00:00:04.000Z",
+       "sessionId": "session-fixture-agent",
+       "uuid": "sr1",
+       "agentId": "helper-1",
+       "message": {
+        "role": "user",
+        "content": [
+         {
+          "type": "tool_result",
+          "tool_use_id": "toolu_sub_grep",
+          "content": "none"
+         }
+        ]
+       }
+      },
+      {
+       "type": "assistant",
+       "timestamp": "2026-01-01T00:00:05.000Z",
+       "sessionId": "session-fixture-agent",
+       "uuid": "sa2",
+       "agentId": "helper-1",
+       "message": {
+        "id": "msg_sub_2",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [
+         {
+          "type": "text",
+          "text": "No TODOs."
+         }
+        ]
+       }
+      }
+     ]
+    }
+   },
+   "trace_id": "58eef7fee3bab188ac15a2e78d5fd180",
+   "root_span_id": "ad171230f31361b9",
+   "llm_calls": {
+    "msg_agent_1": "7f59947d0ff68b9f",
+    "msg_agent_2": "5c72435442ec37b5",
+    "msg_sub_1": "0abf292b51852bf4",
+    "msg_sub_2": "18ffc169af417f96"
+   },
+   "tools": {
+    "toolu_agent_1": "a07be867ef95072d",
+    "toolu_sub_grep": "3dcd2cc3053cf4e3"
+   }
+  }
+ ]
+}

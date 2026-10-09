@@ -2714,6 +2714,31 @@ def derive_turn_trace_id(trace_seed: str, turn_number: int) -> Optional[str]:
     except Exception:
         return None
 
+ROOT_STEP_ID = "root"
+
+def derive_span_id(trace_id_hex: Any, step_id: Any) -> Optional[str]:
+    """Predictable 16-hex span id of one step in a trace.
+
+    Formula: sha256(f"{trace_id}:{step_id}").hexdigest()[:16], where step_id is
+    "root" for the request's root, the tool_use_id for a tool step and the
+    assistant message id for an LLM call. An all-zero result becomes
+    "0000000000000001". Returns None when either part is missing, and the
+    span then keeps a random id.
+    """
+    if not _is_valid_trace_id_hex(trace_id_hex) or not isinstance(step_id, str) or not step_id:
+        return None
+    span_id = hashlib.sha256(f"{trace_id_hex}:{step_id}".encode("utf-8")).hexdigest()[:16]
+    return span_id if int(span_id, 16) != 0 else "0000000000000001"
+
+def derive_child_span_id(parent_otel_span: Any, step_id: Any) -> Optional[str]:
+    """derive_span_id for a step under parent_otel_span, in that span's trace."""
+    try:
+        trace_id = parent_otel_span.get_span_context().trace_id
+        return derive_span_id(f"{trace_id:032x}", step_id)
+    except Exception as e:
+        debug(f"span id derivation for {step_id!r} failed: {e}")
+        return None
+
 def _build_forced_trace_context(trace_id_hex: str,
                                 parent_span_id_hex: Optional[str] = None) -> Optional[Any]:
     """Build an OTel context whose remote parent carries the forced trace id.
@@ -2763,6 +2788,7 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
                      as_root: bool = False,
                      forced_trace_id: Optional[str] = None,
                      forced_parent_span_id: Optional[str] = None,
+                     span_id: Optional[str] = None,
                      **obs_kwargs: Any) -> Any:
     """Create a Langfuse observation with an explicit OTel start_time.
 
@@ -2786,11 +2812,12 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
             f"pin with `pip install \"langfuse>=4.7,<5\"` or update the hook script."
         )
     start_ns = to_otel_nanoseconds(start_time)
-    if parent_otel_span is not None:
-        with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
-            otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
-    else:
-        otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id, forced_parent_span_id)
+    with forced_next_span_id(langfuse, span_id if can_force_span_id(langfuse) else None):
+        if parent_otel_span is not None:
+            with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
+                otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+        else:
+            otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id, forced_parent_span_id)
     if as_root:
         # SDK/server contract: spans under a synthetic trace-id carrier have a
         # parentSpanId that never exports, so the server only treats them as
@@ -3296,6 +3323,7 @@ def emit_single_tool_observation(
             as_type="tool",
             start_time=tool_use_timestamp,
             parent_otel_span=parent_otel_span,
+            span_id=derive_child_span_id(parent_otel_span, tool_use_id),
             input=tool_input,
             metadata=tool_metadata,
             **get_status_kwargs(tool_result.status),
@@ -3493,6 +3521,7 @@ def emit_generation_observation(
     generation_name: str,
     start_timestamp: Optional[datetime],
     generation_kwargs: Dict[str, Any],
+    span_id: Optional[str] = None,
 ) -> Any:
     return _start_backdated(
         langfuse,
@@ -3500,6 +3529,7 @@ def emit_generation_observation(
         as_type="generation",
         start_time=start_timestamp,
         parent_otel_span=parent_otel_span,
+        span_id=span_id,
         **generation_kwargs,
     )
 
@@ -3599,6 +3629,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                 generation_name=generation_name,
                 start_timestamp=generation_start_timestamp,
                 generation_kwargs=generation_kwargs,
+                span_id=derive_child_span_id(parent_otel_span, get_message_id(assistant_message)),
             )
         emitted_tools = emit_tool_observation_batch(
             langfuse,
@@ -4141,19 +4172,19 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         parent_trace_id, parent_span_id = parent_context
         trace_metadata["parent_trace_id"] = parent_trace_id
         trace_metadata["parent_span_id"] = parent_span_id
-        with forced_next_span_id(langfuse, reopen_span_id):
-            return _start_backdated(
-                langfuse,
-                name=root_name,
-                as_type="agent",
-                start_time=parse_timestamp(turn.user_msg),
-                forced_trace_id=parent_trace_id,
-                forced_parent_span_id=parent_span_id,
-                as_root=False,
-                input=root_input,
-                metadata=trace_metadata,
-                **get_status_kwargs(get_turn_status(turn)),
-            )
+        return _start_backdated(
+            langfuse,
+            name=root_name,
+            as_type="agent",
+            start_time=parse_timestamp(turn.user_msg),
+            forced_trace_id=parent_trace_id,
+            forced_parent_span_id=parent_span_id,
+            span_id=reopen_span_id or derive_span_id(parent_trace_id, ROOT_STEP_ID),
+            as_root=False,
+            input=root_input,
+            metadata=trace_metadata,
+            **get_status_kwargs(get_turn_status(turn)),
+        )
     # Opt-in deterministic trace ids: fail open to the carrier-derived id.
     forced_trace_id: Optional[str] = reopen_trace_id
     if trace_seed and forced_trace_id is None:
@@ -4161,19 +4192,23 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
             forced_trace_id = derive_turn_trace_id(trace_seed, turn_num)
         except Exception as e:
             debug(f"trace id derivation failed for turn {turn_num}: {e}")
-    with forced_next_span_id(langfuse, reopen_span_id):
-        return _start_backdated(
-            langfuse,
-            name=root_name,
-            as_type="agent",
-            start_time=parse_timestamp(turn.user_msg),
-            parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
-            forced_trace_id=forced_trace_id,
-            as_root=True,
-            input=root_input,
-            metadata=trace_metadata,
-            **get_status_kwargs(get_turn_status(turn)),
-        )
+    carrier = None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid"))
+    root_trace_id = forced_trace_id
+    if carrier is not None:
+        root_trace_id = f"{carrier.get_span_context().trace_id:032x}"
+    return _start_backdated(
+        langfuse,
+        name=root_name,
+        as_type="agent",
+        start_time=parse_timestamp(turn.user_msg),
+        parent_otel_span=carrier,
+        forced_trace_id=forced_trace_id,
+        span_id=reopen_span_id or derive_span_id(root_trace_id, ROOT_STEP_ID),
+        as_root=True,
+        input=root_input,
+        metadata=trace_metadata,
+        **get_status_kwargs(get_turn_status(turn)),
+    )
 
 
 
