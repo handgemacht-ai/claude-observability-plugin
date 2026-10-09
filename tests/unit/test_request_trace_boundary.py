@@ -260,3 +260,41 @@ def test_root_goes_out_when_the_claim_cannot_be_written(hook_module, fake_langfu
     hook_firing(hook_module, fake_langfuse, transcript, [user_row("u1", 0, "Hi."), assistant_row("a1", 1, [text("Hello.")])])
 
     assert len(sent_roots(fake_langfuse)) == 1
+
+
+def background_launch_rows() -> list[dict[str, Any]]:
+    launch = tool_result_row("r1", 3, "toolu_helper")
+    launch["toolUseResult"] = {"isAsync": True, "status": "async_launched", "agentId": "helper-1"}
+    return [
+        user_row("u1", 0, "Build the feature."),
+        assistant_row("a1", 1, [text("Plan: a helper builds it. Go?")]),
+        user_row("u2", 2, "yes"),
+        assistant_row("a2", 3, [tool_use("toolu_helper", "Agent")]),
+        launch,
+        assistant_row("a3", 4, [text("I have started the helper.")]),
+    ]
+
+
+def helper_finished_rows() -> list[dict[str, Any]]:
+    notification = user_row(
+        "n1", 10,
+        "<task-notification>\n<task-id>helper-1</task-id>\n<tool-use-id>toolu_helper</tool-use-id>\n"
+        "<status>completed</status>\n<result>done</result>\n</task-notification>",
+    )
+    return [notification, assistant_row("a4", 12, [text("The feature is built.")])]
+
+
+def test_root_waits_for_the_background_helper_and_gets_the_final_answer(hook_module, fake_langfuse, tmp_path):
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    started = background_launch_rows()
+    finished = started + helper_finished_rows()
+
+    hook_firing(hook_module, fake_langfuse, transcript, started[:2])
+    hook_firing(hook_module, fake_langfuse, transcript, started)
+    sent_while_helper_runs = sent_roots(fake_langfuse)
+    hook_firing(hook_module, fake_langfuse, transcript, finished)
+
+    [root] = sent_roots(fake_langfuse)
+    assert sent_while_helper_runs == []
+    assert root.output == {"role": "assistant", "content": "The feature is built."}
+    assert root.end_time == hook_module.to_otel_nanoseconds(hook_module.parse_timestamp(finished[-1]))
