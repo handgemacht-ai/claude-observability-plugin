@@ -22,6 +22,34 @@ Everything else works as described in the [README](./README.md).
   a claim file in `~/.claude/state/langfuse_root_claims`; any other process that
   reads the same transcript (for example through a different state directory)
   skips the root.
+- **Predictable span ids**: a program that knows a trace can compute the span
+  id of the root, of every LLM call and of every tool step (edits included)
+  without asking Langfuse, for example to nest its own runs under a step.
+  Write `trace_id` for the 32-hex id of the trace (for the default setup
+  `sha256(f"{session_id}:{uuid of the message that started the request}")`
+  hex, first 32 characters) and `step_id` for the step's own id from the
+  transcript:
+
+  ```
+  span_id = sha256(f"{trace_id}:{step_id}").hexdigest()[:16]
+  ```
+
+  - `step_id` is the text `root` for the root, the `tool_use` block `id`
+    (`toolu_...`) for `Tool: <name>`, and the assistant message `id`
+    (`msg_...`) for `LLM Call`. An edit is a tool step like any other: its
+    span is the one of its `tool_use_id`.
+  - An all-zero result becomes `0000000000000001`.
+  - A step whose transcript row has no id (no `tool_use` id, no message id)
+    keeps a random span id.
+  - The id depends only on the trace and the step, so a turn sent in several
+    Stop firings gives every step the same id each time, and the root that is
+    held back after a question and sent later uses the same root id.
+  - Subagent runs: the LLM calls and tool steps inside a subagent follow the
+    same rule (their message ids and tool ids are unique), in the trace of the
+    main request. The `Subagent: ...`, `Workflow agent: ...` and `Instructions`
+    observations still get random ids.
+  - `tests/fixtures/span_ids.json` holds transcripts with the trace id and the
+    span ids they must give, for checking another implementation.
 - **Instructions and system prompts**: each agent carries an `Instructions`
   child with its system prompt and the instruction files it loaded.
 
