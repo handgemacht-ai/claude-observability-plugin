@@ -161,7 +161,9 @@ class SequentialIdGenerator:
 
 
 class FakeOtelSpan:
-    def __init__(self, name: str, start_time: int | None, span_id: int, context: Any = None) -> None:
+    def __init__(
+        self, name: str, start_time: int | None, span_id: int, context: Any = None, new_trace_id: Any = None
+    ) -> None:
         self.name = name
         self.span_id = span_id
         self.start_time = start_time
@@ -170,9 +172,15 @@ class FakeOtelSpan:
         # The span this one was started under (via the stubbed use_span);
         # None for roots and carrier-context spans.
         self.parent = _ACTIVE_SPAN_STACK[-1] if _ACTIVE_SPAN_STACK else None
-        # Like OTel: a span joins the trace of the span or carrier it starts under.
+        # Like OTel: a span joins the trace of the span or carrier it starts
+        # under; one without either takes a new trace id from the id generator.
         carrier = self.parent or (context or {}).get("current_span")
-        self.trace_id = carrier.get_span_context().trace_id if carrier is not None else span_id
+        if carrier is not None:
+            self.trace_id = carrier.get_span_context().trace_id
+        elif new_trace_id is not None:
+            self.trace_id = new_trace_id()
+        else:
+            self.trace_id = span_id
 
     def get_span_context(self) -> Any:
         return types.SimpleNamespace(trace_id=self.trace_id, span_id=self.span_id)
@@ -186,7 +194,9 @@ class FakeTracer:
         self.id_generator: Any = SequentialIdGenerator()
 
     def start_span(self, *, name: str, start_time: int | None = None, context: Any = None) -> FakeOtelSpan:
-        return FakeOtelSpan(name, start_time, self.id_generator.generate_span_id(), context)
+        return FakeOtelSpan(
+            name, start_time, self.id_generator.generate_span_id(), context, self.id_generator.generate_trace_id
+        )
 
 
 class FakeObservation:

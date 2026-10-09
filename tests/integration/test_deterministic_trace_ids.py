@@ -64,11 +64,8 @@ def get_root_observations(fake_langfuse: Any) -> list[Any]:
 
 
 def get_forced_trace_id(observation: Any) -> int | None:
-    """Trace id forced onto a root span via its remote parent context, if any."""
-    context = observation._otel_span.context
-    if context is None:
-        return None
-    return context["current_span"].get_span_context().trace_id
+    """Trace id the root span opened its trace with."""
+    return observation._otel_span.trace_id
 
 
 def test_seeded_turns_get_individually_predictable_trace_ids(
@@ -94,15 +91,12 @@ def test_seeded_turns_get_individually_predictable_trace_ids(
     assert second_id == expected_trace_id(seed, 2)
     assert first_id != second_id
 
-    # The remote parent context carries a sampled, remote span context so
-    # the SDK exports the span under the derived trace id.
-    parent_context = roots[0]._otel_span.context["current_span"].get_span_context()
-    assert parent_context.is_remote is True
-    assert parent_context.span_id != 0
-    assert int(parent_context.trace_flags) & 0x01
+    # The roots open their traces themselves: no parent span.
+    for root in roots:
+        assert root._otel_span.parent is None
+        assert root._otel_span.context is None
 
-    # Only the root span is started in the forced context; children inherit
-    # the trace via their parent span as before.
+    # Children inherit the trace via their parent span as before.
     for observation in fake_langfuse.observations:
         if observation.name != "Conversational Turn":
             assert observation._otel_span.context is None
