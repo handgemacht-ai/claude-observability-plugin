@@ -1240,14 +1240,28 @@ def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[
     return [tool_use_id for tool_use_id in queued if tool_use_id not in delivered]
 
 
+def notification_awaits_answer(rows: List[Dict[str, Any]]) -> bool:
+    """True when a delivered task notification comes after the turn's last
+    assistant row: the agent's answer to it is still to come. The Stop after
+    that answer can fire before the answer reaches the transcript file."""
+    for row in reversed(rows):
+        if get_user_or_assistant_role_from_row(row) == "assistant":
+            return False
+        if is_task_notification_row(row) and row.get("type") != "queue-operation":
+            return True
+    return False
+
+
 def turn_has_unresolved_async_activity(turn: Turn) -> bool:
     """True while the turn's emitted form can provably still change: an async
-    agent has not delivered its final result, or a notification is queued but
-    not yet delivered. Exported roots are immutable, so emission must wait
-    for this gate (or for the turn to close)."""
+    agent has not delivered its final result, a notification is queued but
+    not yet delivered, or a delivered one has no answer yet. Exported roots
+    are immutable, so emission must wait for this gate (or for the turn to
+    close)."""
     return bool(
         get_pending_agent_tool_use_ids(turn)
         or get_undelivered_queued_notification_ids(turn.rows)
+        or notification_awaits_answer(turn.rows)
     )
 
 

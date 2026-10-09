@@ -298,3 +298,40 @@ def test_root_waits_for_the_background_helper_and_gets_the_final_answer(hook_mod
     assert sent_while_helper_runs == []
     assert root.output == {"role": "assistant", "content": "The feature is built."}
     assert root.end_time == hook_module.to_otel_nanoseconds(hook_module.parse_timestamp(finished[-1]))
+
+
+def real_run_on_disk_at_a_stop(fixture: Path, project: Path, session: str, main_rows: int, until: str) -> Path:
+    rows = (fixture / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+    transcript = project / f"{session}.jsonl"
+    transcript.write_text("\n".join(rows[:main_rows]) + "\n", encoding="utf-8")
+    subagents = project / session / "subagents"
+    subagents.mkdir(parents=True, exist_ok=True)
+    for source in (fixture / "transcript" / "subagents").iterdir():
+        lines = source.read_text(encoding="utf-8").splitlines()
+        if source.suffix == ".jsonl":
+            lines = [line for line in lines if json.loads(line).get("timestamp", "") <= until]
+        (subagents / source.name).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return transcript
+
+
+def test_root_waits_for_the_answer_to_a_helper_notification_not_yet_on_disk(
+    hook_module, fake_langfuse, tmp_path, fixture_transcript_path
+):
+    fixture = fixture_transcript_path("background_helper_answer_late_on_disk").parent
+    session = "c4dda0fb-0b51-4948-8978-29eb1c492323"
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+    rows_on_disk_at_each_stop = [
+        (3, "2026-10-09T13:47:18.6"),
+        (10, "2026-10-09T13:47:34.0"),
+        (15, "2026-10-09T13:47:52.0"),
+        (21, "2026-10-09T13:48:04.7"),
+    ]
+
+    for main_rows, until in rows_on_disk_at_each_stop:
+        transcript = real_run_on_disk_at_a_stop(fixture, tmp_path, session, main_rows, until)
+        hook_module.emit_new_turns_from_transcript(fake_langfuse, config, session, transcript)
+
+    [root] = sent_roots(fake_langfuse)
+    last_answer = json.loads((fixture / "transcript.jsonl").read_text(encoding="utf-8").splitlines()[20])
+    assert root.output["content"].startswith("Done: `shout` stays as one line")
+    assert root.end_time == hook_module.to_otel_nanoseconds(hook_module.parse_timestamp(last_answer))
