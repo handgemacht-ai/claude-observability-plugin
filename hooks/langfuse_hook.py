@@ -2773,6 +2773,13 @@ def _build_forced_trace_context(trace_id_hex: str,
 def _start_root_otel_span(langfuse: Langfuse, name: str, start_ns: Optional[int],
                           forced_trace_id: Optional[str],
                           forced_parent_span_id: Optional[str] = None) -> Any:
+    if forced_trace_id and forced_parent_span_id is None and can_force_span_id(langfuse):
+        # The root opens the trace itself: no parent, so the server finds it as the trace's root.
+        try:
+            with forced_next_trace_id(langfuse, forced_trace_id):
+                return langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+        except Exception as e:
+            debug(f"start_span with forced trace id {forced_trace_id!r} failed: {e}")
     if forced_trace_id:
         context = _build_forced_trace_context(forced_trace_id, forced_parent_span_id)
         if context is not None:
@@ -4080,8 +4087,37 @@ class _FixedSpanIdGenerator:
         return self._real.is_trace_id_random()
 
 
+class _FixedTraceIdGenerator:
+    """Hands out one given trace id; everything else comes from the real generator."""
+
+    def __init__(self, real: Any, trace_id: int) -> None:
+        self._real = real
+        self._trace_id = trace_id
+
+    def generate_span_id(self) -> int:
+        return self._real.generate_span_id()
+
+    def generate_trace_id(self) -> int:
+        return self._trace_id
+
+    def is_trace_id_random(self) -> bool:
+        return self._real.is_trace_id_random()
+
+
 def can_force_span_id(langfuse: Langfuse) -> bool:
     return hasattr(getattr(langfuse, "_otel_tracer", None), "id_generator")
+
+
+@contextlib.contextmanager
+def forced_next_trace_id(langfuse: Langfuse, trace_id_hex: str) -> Iterator[None]:
+    """Make the next span started without a parent open a trace with this 32-hex id."""
+    tracer = langfuse._otel_tracer
+    real = tracer.id_generator
+    tracer.id_generator = _FixedTraceIdGenerator(real, int(trace_id_hex, 16))
+    try:
+        yield
+    finally:
+        tracer.id_generator = real
 
 
 @contextlib.contextmanager
@@ -4196,13 +4232,15 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
     root_trace_id = forced_trace_id
     if carrier is not None:
         root_trace_id = f"{carrier.get_span_context().trace_id:032x}"
+    if can_force_span_id(langfuse):
+        carrier = None
     return _start_backdated(
         langfuse,
         name=root_name,
         as_type="agent",
         start_time=parse_timestamp(turn.user_msg),
         parent_otel_span=carrier,
-        forced_trace_id=forced_trace_id,
+        forced_trace_id=root_trace_id,
         span_id=reopen_span_id or derive_span_id(root_trace_id, ROOT_STEP_ID),
         as_root=True,
         input=root_input,

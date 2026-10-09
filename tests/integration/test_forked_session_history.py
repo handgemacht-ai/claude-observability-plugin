@@ -139,11 +139,7 @@ def test_seeded_fork_turns_get_trace_ids_of_their_own(
     hook_module.emit_new_turns_from_transcript(
         fake_langfuse, config, ORIGINAL_SESSION, original
     )
-    original_trace_ids = {
-        o._otel_span.context["current_span"].get_span_context().trace_id
-        for o in roots(fake_langfuse)
-        if o._otel_span.context
-    }
+    original_trace_ids = {o._otel_span.trace_id for o in roots(fake_langfuse)}
 
     fork = fork_transcript(original, tmp_path)
     append_rows(fork, turn_rows(FORK_SESSION, 4))
@@ -152,9 +148,9 @@ def test_seeded_fork_turns_get_trace_ids_of_their_own(
     hook_module.emit_new_turns_from_transcript(fake_langfuse, config, FORK_SESSION, fork)
 
     fork_trace_ids = {
-        o._otel_span.context["current_span"].get_span_context().trace_id
+        o._otel_span.trace_id
         for o in fake_langfuse.observations[before:]
-        if o.name == "Conversational Turn" and o._otel_span.context
+        if o.name == "Conversational Turn"
     }
     assert fork_trace_ids
     assert not (fork_trace_ids & original_trace_ids)

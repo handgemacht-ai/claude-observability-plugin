@@ -54,6 +54,19 @@ def test_steps_carry_the_ids_listed_in_the_fixture(hook_module, fake_langfuse, t
     assert [o.id for o in edits] == [id for step, id in case["tools"].items() if step.startswith("toolu_edit")]
 
 
+def parent_of(observation: Any) -> Any:
+    otel_span = observation._otel_span
+    return otel_span.parent or (otel_span.context or {}).get("current_span")
+
+
+@pytest.mark.parametrize("case_name", sorted(CASES))
+def test_the_root_has_no_parent(hook_module, fake_langfuse, tmp_path, case_name):
+    run_case(hook_module, fake_langfuse, tmp_path, CASES[case_name])
+
+    [root] = sent_roots(fake_langfuse)
+    assert parent_of(root) is None
+
+
 @pytest.mark.parametrize("case_name", sorted(CASES))
 def test_fixture_ids_follow_the_written_formula(case_name):
     case = CASES[case_name]
