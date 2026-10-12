@@ -38,6 +38,9 @@ def _install_langfuse_stubs() -> None:
     langfuse_module = types.ModuleType("langfuse")
 
     class Langfuse:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
         @staticmethod
         def create_trace_id(*, seed: str | None = None) -> str:
             # Mirrors langfuse v4: seeded trace ids are sha256(seed)[:32].
