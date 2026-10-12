@@ -378,6 +378,17 @@ try:
 except Exception:
     LangfuseMedia = None
 
+def read_plugin_version() -> Optional[str]:
+    """Version from the plugin's own .claude-plugin/plugin.json, or None."""
+    try:
+        manifest = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
+        version = json.loads(manifest.read_text(encoding="utf-8")).get("version")
+        return version if isinstance(version, str) and version else None
+    except Exception as e:
+        debug(f"plugin version unreadable ({type(e).__name__}: {e}); sending without release")
+        return None
+
+
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
     # With capture off, stop the SDK from uploading base64 images it finds
     # in span payloads on its own. The SDK reads an empty value as enabled.
@@ -388,6 +399,7 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
             public_key=config.public_key,
             secret_key=config.secret_key,
             host=config.host,
+            release=read_plugin_version(),
         )
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
