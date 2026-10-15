@@ -575,3 +575,5 @@ def test_a_resumed_agent_whose_meta_lost_its_launch_id_ships_every_run(hook_modu
     resumed_run = next(o for o in x_generations if o.kwargs["output"]["content"] == "X second.")
     assert launch_run.trace_id == launch_tool.trace_id
     assert resumed_run.trace_id == resume_tool.trace_id
+    assert launch_tool.kwargs["metadata"]["subagent_type"] == "planner"
+    assert launch_tool.kwargs["metadata"]["subagent_description"] == "x"
