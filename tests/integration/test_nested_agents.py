@@ -517,3 +517,61 @@ def test_an_agent_resumed_by_a_later_turns_agent_ships_each_run_once(hook_module
         if o.as_type == "generation" and o.kwargs["metadata"].get("agent_id") == "b"
     ]
     assert len(b_generations) == 2
+
+
+def test_a_resumed_agent_whose_meta_lost_its_launch_id_ships_every_run(hook_module, fake_langfuse, tmp_path):
+    transcript = tmp_path / "session-resume.jsonl"
+    write_session(transcript, [
+        main_row("user", "u1", "2026-01-01T00:00:00.000Z", "Start X"),
+        main_row("assistant", "a1", "2026-01-01T00:00:01.000Z",
+                 tool_use("toolu_x", "Agent", {"subagent_type": "planner", "description": "x"})),
+        main_row("user", "r1", "2026-01-01T00:00:01.200Z", tool_result("toolu_x", "Async agent launched successfully."),
+                 toolUseResult={"isAsync": True, "status": "async_launched", "agentId": "x"}),
+        main_row("assistant", "a2", "2026-01-01T00:00:02.000Z", [{"type": "text", "text": "started"}]),
+        main_row("user", "n1", "2026-01-01T00:00:05.000Z",
+                 "<task-notification><task-id>x</task-id><tool-use-id>toolu_x</tool-use-id>"
+                 "<result>X first.</result></task-notification>",
+                 origin={"kind": "task-notification"}),
+        main_row("assistant", "a3", "2026-01-01T00:00:06.000Z", [{"type": "text", "text": "X said first"}]),
+        main_row("user", "u2", "2026-01-01T00:01:00.000Z", "Ask X again"),
+        main_row("assistant", "a4", "2026-01-01T00:01:01.000Z",
+                 tool_use("toolu_send", "SendMessage", {"to": "x", "message": "again"})),
+        main_row("user", "r4", "2026-01-01T00:01:01.500Z", tool_result("toolu_send", "Agent resumed."),
+                 toolUseResult={"success": True, "resumedAgentId": "x"}),
+        main_row("assistant", "a5", "2026-01-01T00:01:02.000Z", [{"type": "text", "text": "waiting"}]),
+        main_row("user", "n2", "2026-01-01T00:01:10.000Z",
+                 "<task-notification><task-id>x</task-id><tool-use-id>toolu_send</tool-use-id>"
+                 "<result>X second.</result></task-notification>",
+                 origin={"kind": "task-notification"}),
+        main_row("assistant", "a6", "2026-01-01T00:01:11.000Z", [{"type": "text", "text": "X said second"}]),
+    ])
+    subagents_dir = tmp_path / "session-resume" / "subagents"
+    write_agent(subagents_dir, "x", "toolu_x", [
+        main_row("user", "xu1", "2026-01-01T00:00:01.100Z", "go"),
+        main_row("assistant", "xa1", "2026-01-01T00:00:04.000Z", [{"type": "text", "text": "X first."}]),
+        main_row("user", "xc", "2026-01-01T00:01:02.000Z", "again", isMeta=True, origin={"kind": "coordinator"}),
+        main_row("assistant", "xa2", "2026-01-01T00:01:09.000Z", [{"type": "text", "text": "X second."}]),
+    ])
+    # Shape of a real meta.json rewritten at a resume: the launch link is gone.
+    (subagents_dir / "agent-x.meta.json").write_text(
+        json.dumps({"agentType": "general-purpose", "spawnDepth": 1, "requestShape": "background",
+                    "requestNonInteractive": True}),
+        encoding="utf-8",
+    )
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config, "session-resume", transcript, flush_deferred_agent_turns=True
+    )
+
+    x_generations = [
+        o for o in fake_langfuse.observations
+        if o.as_type == "generation" and o.kwargs["metadata"].get("agent_id") == "x"
+    ]
+    assert sorted(o.kwargs["output"]["content"] for o in x_generations) == ["X first.", "X second."]
+    launch_tool = next(o for o in fake_langfuse.observations if o.name == "Tool: Agent")
+    resume_tool = next(o for o in fake_langfuse.observations if o.name == "Tool: SendMessage")
+    launch_run = next(o for o in x_generations if o.kwargs["output"]["content"] == "X first.")
+    resumed_run = next(o for o in x_generations if o.kwargs["output"]["content"] == "X second.")
+    assert launch_run.trace_id == launch_tool.trace_id
+    assert resumed_run.trace_id == resume_tool.trace_id

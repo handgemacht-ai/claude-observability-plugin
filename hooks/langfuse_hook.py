@@ -1778,6 +1778,44 @@ def get_agent_launch_tool_use_ids_by_name(transcript_path: Path) -> Dict[str, st
         return {}
     return {name: tool_use_id for name, tool_use_id in mapping.items() if name not in ambiguous}
 
+def get_agent_launch_tool_use_ids_by_agent_id(transcript_path: Path) -> Dict[str, str]:
+    """Map each agent id to the tool_use id of its launch, read from the
+    launch's tool_result (toolUseResult.agentId).
+    The function streams the full transcript. It removes ambiguous agent ids."""
+    launch_tool_use_ids: set = set()
+    mapping: Dict[str, str] = {}
+    ambiguous: set = set()
+    try:
+        with transcript_path.open(encoding="utf-8") as lines:
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                content = get_content_from_row(row)
+                for tool_use in get_tool_use_blocks(content):
+                    if tool_use.get("name") in ("Agent", "Task") and tool_use.get("id"):
+                        launch_tool_use_ids.add(str(tool_use["id"]))
+                tool_use_result = row.get("toolUseResult")
+                agent_id = tool_use_result.get("agentId") if isinstance(tool_use_result, dict) else None
+                if not isinstance(agent_id, str) or not agent_id:
+                    continue
+                for tool_result_block in get_tool_result_blocks(content):
+                    tool_use_id = str(tool_result_block.get("tool_use_id") or "")
+                    if tool_use_id not in launch_tool_use_ids:
+                        continue
+                    if mapping.get(agent_id, tool_use_id) != tool_use_id:
+                        ambiguous.add(agent_id)
+                    mapping[agent_id] = tool_use_id
+    except Exception:
+        return {}
+    return {agent_id: tool_use_id for agent_id, tool_use_id in mapping.items() if agent_id not in ambiguous}
+
 def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
     """Map launching Agent/Task tool_use ids to their subagent transcripts."""
     subagent_dir = transcript_path.with_suffix("") / "subagents"
@@ -1786,6 +1824,7 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
 
     # Build the fallback map only when a meta has no toolUseId.
     fallback_tool_use_ids: Optional[Dict[str, str]] = None
+    fallback_tool_use_ids_by_agent_id: Optional[Dict[str, str]] = None
     claimed_twice: set = set()
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]] = {}
     for meta_path in sorted(subagent_dir.glob("*.meta.json")):
@@ -1808,6 +1847,11 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
             # A teammate meta carries the launch input.name.
             name = metadata.get("name")
             tool_use_id = fallback_tool_use_ids.get(name) if isinstance(name, str) else None
+        if not tool_use_id:
+            # A meta rewritten at a resume can lose toolUseId; the launch result names the agent id.
+            if fallback_tool_use_ids_by_agent_id is None:
+                fallback_tool_use_ids_by_agent_id = get_agent_launch_tool_use_ids_by_agent_id(transcript_path)
+            tool_use_id = fallback_tool_use_ids_by_agent_id.get(agent_id)
         if not tool_use_id:
             info(f"subagent transcript not attributable to a launching tool_use, skipping: {meta_path}")
             continue
