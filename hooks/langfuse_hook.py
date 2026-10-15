@@ -1778,11 +1778,11 @@ def get_agent_launch_tool_use_ids_by_name(transcript_path: Path) -> Dict[str, st
         return {}
     return {name: tool_use_id for name, tool_use_id in mapping.items() if name not in ambiguous}
 
-def get_agent_launch_tool_use_ids_by_agent_id(transcript_path: Path) -> Dict[str, str]:
-    """Map each agent id to the tool_use id of its launch, read from the
+def get_agent_launches_by_agent_id(transcript_path: Path) -> Dict[str, Tuple[str, Dict[str, Any]]]:
+    """Map each agent id to (tool_use id, input) of its launch, read from the
     launch's tool_result (toolUseResult.agentId).
     The function streams the full transcript. It removes ambiguous agent ids."""
-    launch_tool_use_ids: set = set()
+    launch_inputs: Dict[str, Dict[str, Any]] = {}
     mapping: Dict[str, str] = {}
     ambiguous: set = set()
     try:
@@ -1800,21 +1800,26 @@ def get_agent_launch_tool_use_ids_by_agent_id(transcript_path: Path) -> Dict[str
                 content = get_content_from_row(row)
                 for tool_use in get_tool_use_blocks(content):
                     if tool_use.get("name") in ("Agent", "Task") and tool_use.get("id"):
-                        launch_tool_use_ids.add(str(tool_use["id"]))
+                        tool_input = tool_use.get("input")
+                        launch_inputs[str(tool_use["id"])] = tool_input if isinstance(tool_input, dict) else {}
                 tool_use_result = row.get("toolUseResult")
                 agent_id = tool_use_result.get("agentId") if isinstance(tool_use_result, dict) else None
                 if not isinstance(agent_id, str) or not agent_id:
                     continue
                 for tool_result_block in get_tool_result_blocks(content):
                     tool_use_id = str(tool_result_block.get("tool_use_id") or "")
-                    if tool_use_id not in launch_tool_use_ids:
+                    if tool_use_id not in launch_inputs:
                         continue
                     if mapping.get(agent_id, tool_use_id) != tool_use_id:
                         ambiguous.add(agent_id)
                     mapping[agent_id] = tool_use_id
     except Exception:
         return {}
-    return {agent_id: tool_use_id for agent_id, tool_use_id in mapping.items() if agent_id not in ambiguous}
+    return {
+        agent_id: (tool_use_id, launch_inputs[tool_use_id])
+        for agent_id, tool_use_id in mapping.items()
+        if agent_id not in ambiguous
+    }
 
 def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
     """Map launching Agent/Task tool_use ids to their subagent transcripts."""
@@ -1824,7 +1829,7 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
 
     # Build the fallback map only when a meta has no toolUseId.
     fallback_tool_use_ids: Optional[Dict[str, str]] = None
-    fallback_tool_use_ids_by_agent_id: Optional[Dict[str, str]] = None
+    fallback_launches_by_agent_id: Optional[Dict[str, Tuple[str, Dict[str, Any]]]] = None
     claimed_twice: set = set()
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]] = {}
     for meta_path in sorted(subagent_dir.glob("*.meta.json")):
@@ -1849,9 +1854,15 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
             tool_use_id = fallback_tool_use_ids.get(name) if isinstance(name, str) else None
         if not tool_use_id:
             # A meta rewritten at a resume can lose toolUseId; the launch result names the agent id.
-            if fallback_tool_use_ids_by_agent_id is None:
-                fallback_tool_use_ids_by_agent_id = get_agent_launch_tool_use_ids_by_agent_id(transcript_path)
-            tool_use_id = fallback_tool_use_ids_by_agent_id.get(agent_id)
+            if fallback_launches_by_agent_id is None:
+                fallback_launches_by_agent_id = get_agent_launches_by_agent_id(transcript_path)
+            tool_use_id, launch_input = fallback_launches_by_agent_id.get(agent_id, ("", {}))
+            # The rewritten meta lost the label too; the launch input has it.
+            metadata = {
+                **metadata,
+                "agentType": launch_input.get("subagent_type") or metadata.get("agentType"),
+                "description": launch_input.get("description") or metadata.get("description"),
+            }
         if not tool_use_id:
             info(f"subagent transcript not attributable to a launching tool_use, skipping: {meta_path}")
             continue
