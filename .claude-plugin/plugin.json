@@ -82,6 +82,11 @@
       "type": "string",
       "title": "Trace ID seed",
       "description": "Optional. Derive deterministic trace ids as Langfuse.create_trace_id(seed=f\"{seed}:{turn_number}\") so external systems can precompute them. Use a unique seed per session (e.g. the --session-id UUID). Leave empty for auto-generated ids."
+    },
+    "CC_LANGFUSE_API_REQUESTS_DIR": {
+      "type": "string",
+      "title": "Saved API requests directory",
+      "description": "Optional. The <dir> of OTEL_LOG_RAW_API_BODIES=file:<dir>, to take LLM Call inputs from the API requests Claude Code saved. Leave empty to rebuild them from the transcript."
     }
   }
 }
