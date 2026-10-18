@@ -3180,17 +3180,17 @@ def build_session_history(
 # ---- Saved API requests ----
 # With OTEL_LOG_RAW_API_BODIES=file:<dir>, Claude Code saves each API request
 # and response it sends, and adds one index.jsonl line per call that names the
-# message the call produced and the files of its request and response.
-SAVED_API_REQUESTS_VAR = "OTEL_LOG_RAW_API_BODIES"
+# message the call produced and the files of its request and response. Claude
+# Code keeps OTEL_* variables out of the hook environment, so the hook learns
+# <dir> from CC_LANGFUSE_API_REQUESTS_DIR.
+SAVED_API_REQUESTS_VAR = "CC_LANGFUSE_API_REQUESTS_DIR"
 SAVED_API_REQUESTS_INDEX = "index.jsonl"
 SAVED_API_REQUESTS_INDEX_AGE = timedelta(days=1)
 SAVED_API_REQUESTS_MAX_AGE = timedelta(days=7)
 
 def get_saved_api_requests_dir() -> Optional[Path]:
-    value = os.environ.get(SAVED_API_REQUESTS_VAR, "")
-    if not value.startswith("file:") or not value[len("file:"):]:
-        return None
-    return Path(value[len("file:"):]).expanduser()
+    value = _opt(SAVED_API_REQUESTS_VAR)
+    return Path(value).expanduser() if value else None
 
 # A saved call: its request and its response, either None when its file is missing.
 SavedApiCall = Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]

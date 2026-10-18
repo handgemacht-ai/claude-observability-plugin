@@ -91,7 +91,7 @@ def test_generation_input_is_the_saved_conversation_with_hook_notes(
     hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
 ):
     saved = tmp_path / "saved"
-    monkeypatch.setenv("OTEL_LOG_RAW_API_BODIES", f"file:{saved}")
+    monkeypatch.setenv("CC_LANGFUSE_API_REQUESTS_DIR", str(saved))
     question = {"role": "user", "content": [{"type": "text", "text": "Question 1?"}]}
     tool_result = {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "toolu-1", "content": "file content"}]}
@@ -111,7 +111,7 @@ def test_generation_input_is_rebuilt_when_a_saved_call_is_missing(
     hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
 ):
     saved = tmp_path / "saved"
-    monkeypatch.setenv("OTEL_LOG_RAW_API_BODIES", f"file:{saved}")
+    monkeypatch.setenv("CC_LANGFUSE_API_REQUESTS_DIR", str(saved))
     save_call(saved, "msg-1-1", [HOOK_NOTE], ANSWER, previous_message_id="msg-1-0")
     transcript = tmp_path / f"{SESSION}.jsonl"
     write_transcript(transcript)
@@ -124,7 +124,7 @@ def test_generation_input_is_rebuilt_when_a_saved_call_is_missing(
 
 def test_sweep_starts_a_new_index_daily_and_drops_week_old_files(hook_module, tmp_path, monkeypatch):
     saved = tmp_path / "saved"
-    monkeypatch.setenv("OTEL_LOG_RAW_API_BODIES", f"file:{saved}")
+    monkeypatch.setenv("CC_LANGFUSE_API_REQUESTS_DIR", str(saved))
     save_call(saved, "msg-old", [HOOK_NOTE], ANSWER, timestamp="2026-10-10T08:00:00.000Z")
     old_request = saved / "request-of-msg-old.request.json"
     week_ago = datetime(2026, 10, 10, tzinfo=timezone.utc).timestamp()
