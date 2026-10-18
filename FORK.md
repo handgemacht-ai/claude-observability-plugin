@@ -126,6 +126,28 @@ from the working directory), then `~/.claude/agents` (or
 `<plugin>:<agent>` names. Built-in agents such as `Explore` and
 `general-purpose` are marked `builtin`.
 
+## LLM Call Inputs
+
+Each `LLM Call` input is the conversation the model got for that call. With
+
+```
+OTEL_LOG_RAW_API_BODIES=file:<dir>
+```
+
+in the `env` of the user settings, Claude Code saves every API request and
+response in `<dir>`, and the input comes from those saved requests: the
+messages exactly as sent, with the system reminders, the context that hooks
+added after a tool call and the messages typed while the agent worked, each at
+the point where the model got it. Without the setting, or when a saved request
+of the conversation is missing (older sessions, a fork of another session), the
+input is rebuilt from the transcript, which holds the user messages, the
+assistant messages and the tool results only. `metadata.history.source` is
+`saved_api_request` for an input from the saved requests.
+
+At the end of a session, the plugin starts a new `index.jsonl` in `<dir>` when
+the current one is older than a day, and removes saved requests and old
+indexes that are older than seven days.
+
 ## What Is Not Captured
 
 - The system prompt of an agent when Claude Code wrote no prompt record for it
@@ -135,7 +157,8 @@ from the working directory), then `~/.claude/agents` (or
   definition file cannot be found, so they show `source: unknown`.
 - The full tool definitions: only the tool names are recorded.
 - Per-request system reminders and other context Claude Code adds on the fly,
-  unless it is written to the transcript.
+  unless `OTEL_LOG_RAW_API_BODIES=file:<dir>` is set (see LLM Call Inputs) or
+  it is written to the transcript.
 - Instruction file contents with `CC_LANGFUSE_CAPTURE_INSTRUCTIONS=false`, and
   system prompts with `CC_LANGFUSE_CAPTURE_SYSTEM_PROMPT=false`.
 
