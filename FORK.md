@@ -55,13 +55,15 @@ Everything else works as described in the [README](./README.md).
 
 ## Settings
 
-Two settings turn instructions capture off. `/plugin configure` lists them next
-to the other optional settings.
+Two settings turn instructions capture off, and one takes LLM Call inputs from
+the saved API requests. `/plugin configure` lists them next to the other
+optional settings.
 
 | Setting | Description | Default |
 | --- | --- | --- |
 | `CC_LANGFUSE_CAPTURE_INSTRUCTIONS` | Attach the instruction files each agent loaded (`CLAUDE.md`, rules, nested memory) with their contents. `false` sends neither the file list nor the contents. | `true` |
 | `CC_LANGFUSE_CAPTURE_SYSTEM_PROMPT` | Attach each agent's system prompt. | `true` |
+| `CC_LANGFUSE_API_REQUESTS_DIR` | The `<dir>` of `OTEL_LOG_RAW_API_BODIES=file:<dir>`, to take LLM Call inputs from the saved API requests (see LLM Call Inputs). | empty |
 
 ## Trace Shape
 
@@ -132,13 +134,16 @@ Each `LLM Call` input is the conversation the model got for that call. With
 
 ```
 OTEL_LOG_RAW_API_BODIES=file:<dir>
+CC_LANGFUSE_API_REQUESTS_DIR=<dir>
 ```
 
 in the `env` of the user settings, Claude Code saves every API request and
 response in `<dir>`, and the input comes from those saved requests: the
 messages exactly as sent, with the system reminders, the context that hooks
 added after a tool call and the messages typed while the agent worked, each at
-the point where the model got it. Without the setting, or when a saved request
+the point where the model got it. Claude Code keeps `OTEL_*` variables from
+hooks, so the plugin needs the second variable to find `<dir>`. Without the
+settings, or when a saved request
 of the conversation is missing (older sessions, a fork of another session), the
 input is rebuilt from the transcript, which holds the user messages, the
 assistant messages and the tool results only. `metadata.history.source` is
@@ -157,7 +162,7 @@ indexes that are older than seven days.
   definition file cannot be found, so they show `source: unknown`.
 - The full tool definitions: only the tool names are recorded.
 - Per-request system reminders and other context Claude Code adds on the fly,
-  unless `OTEL_LOG_RAW_API_BODIES=file:<dir>` is set (see LLM Call Inputs) or
+  unless Claude Code saves its API requests (see LLM Call Inputs) or
   it is written to the transcript.
 - Instruction file contents with `CC_LANGFUSE_CAPTURE_INSTRUCTIONS=false`, and
   system prompts with `CC_LANGFUSE_CAPTURE_SYSTEM_PROMPT=false`.
