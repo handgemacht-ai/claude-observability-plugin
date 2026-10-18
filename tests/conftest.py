@@ -27,6 +27,7 @@ os.environ.pop("CC_LANGFUSE_STATE_DIR", None)
 os.environ.pop("CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_STATE_DIR", None)
 os.environ.pop("CC_LANGFUSE_CAPTURE_IMAGES", None)
 os.environ.pop("CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_CAPTURE_IMAGES", None)
+os.environ.pop("OTEL_LOG_RAW_API_BODIES", None)
 
 # Mirrors OTel's active-span context: the stubbed use_span pushes the parent
 # span here so FakeOtelSpan can record which span it was started under,

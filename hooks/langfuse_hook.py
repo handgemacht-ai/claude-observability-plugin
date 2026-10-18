@@ -3177,6 +3177,157 @@ def build_session_history(
     return history
 
 
+# ---- Saved API requests ----
+# With OTEL_LOG_RAW_API_BODIES=file:<dir>, Claude Code saves each API request
+# and response it sends, and adds one index.jsonl line per call that names the
+# message the call produced and the files of its request and response.
+SAVED_API_REQUESTS_VAR = "OTEL_LOG_RAW_API_BODIES"
+SAVED_API_REQUESTS_INDEX = "index.jsonl"
+SAVED_API_REQUESTS_INDEX_AGE = timedelta(days=1)
+SAVED_API_REQUESTS_MAX_AGE = timedelta(days=7)
+
+def get_saved_api_requests_dir() -> Optional[Path]:
+    value = os.environ.get(SAVED_API_REQUESTS_VAR, "")
+    if not value.startswith("file:") or not value[len("file:"):]:
+        return None
+    return Path(value[len("file:"):]).expanduser()
+
+# A saved call: its request and its response, either None when its file is missing.
+SavedApiCall = Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]
+
+def get_previous_message_id(request: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The message of the call this request continues; None for a request that starts its thread."""
+    thread = request.get("thread") if request is not None else None
+    continues_thread = isinstance(thread, dict) and thread.get("type") == "continue"
+    previous = thread.get("previous_message_id") if continues_thread else None
+    return previous if isinstance(previous, str) and previous else None
+
+def is_complete_call_chain(calls: List[SavedApiCall]) -> bool:
+    """Every call has its request, and every call before the newest has its response."""
+    has_every_request = all(
+        request is not None and isinstance(request.get("messages"), list) for request, _ in calls
+    )
+    has_earlier_responses = all(response is not None for _, response in calls[1:])
+    return has_every_request and has_earlier_responses
+
+def build_conversation_of_calls(calls: List[SavedApiCall]) -> List[Dict[str, Any]]:
+    """The messages of a complete chain, newest call first, in the order the model got them."""
+    conversation: List[Dict[str, Any]] = []
+    oldest_first = list(reversed(calls))
+    for position, (request, response) in enumerate(oldest_first):
+        conversation.extend(request["messages"])
+        is_earlier_call = position < len(oldest_first) - 1
+        if is_earlier_call:
+            conversation.append({"role": "assistant", "content": response.get("content")})
+    return conversation
+
+
+class SavedApiRequests:
+    """The saved API requests, by the id of the message each call produced.
+
+    A request in a thread holds only the messages added since the call before
+    it (thread.previous_message_id); the API keeps the rest. The conversation
+    of a call is the chain of requests and their responses back to the
+    request that started the thread.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.entries: Dict[str, Dict[str, Any]] = {}
+        self.bodies: Dict[str, Optional[Dict[str, Any]]] = {}
+        self.read_index()
+
+    def read_index(self) -> None:
+        for path in sorted(self.directory.glob("index*.jsonl")):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                message_id = entry.get("message_id") if isinstance(entry, dict) else None
+                if isinstance(message_id, str) and message_id:
+                    self.entries[message_id] = entry
+
+    def entry(self, message_id: str) -> Optional[Dict[str, Any]]:
+        if message_id not in self.entries:
+            self.read_index()
+        return self.entries.get(message_id)
+
+    def body(self, entry: Optional[Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+        name = entry.get(key) if entry is not None else None
+        if not isinstance(name, str) or not name:
+            return None
+        if name not in self.bodies:
+            try:
+                body = json.loads((self.directory / name).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                body = None
+            self.bodies[name] = body if isinstance(body, dict) else None
+        return self.bodies[name]
+
+    def calls_back_from(self, message_id: str) -> Optional[List[SavedApiCall]]:
+        """The calls of a thread from the one that produced message_id back to
+        the first; None when the chain does not end at a first call."""
+        calls: List[SavedApiCall] = []
+        current: Optional[str] = message_id
+        while current is not None and len(calls) <= len(self.entries):
+            entry = self.entry(current)
+            request = self.body(entry, "request_file")
+            calls.append((request, self.body(entry, "response_file")))
+            current = get_previous_message_id(request)
+        return calls if current is None else None
+
+    def conversation(self, message_id: str) -> Optional[List[Dict[str, Any]]]:
+        """The messages the model got for the call that produced message_id; None when a link is missing."""
+        calls = self.calls_back_from(message_id)
+        chain_is_usable = calls is not None and is_complete_call_chain(calls)
+        return build_conversation_of_calls(calls) if chain_is_usable else None
+
+
+_saved_api_requests: Optional[SavedApiRequests] = None
+
+def get_saved_api_request_input(assistant_message: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """The input the model got for this assistant message, as Claude Code saved it."""
+    global _saved_api_requests
+    directory = get_saved_api_requests_dir()
+    message_id = get_message_id(assistant_message)
+    if directory is None or message_id is None:
+        return None
+    if _saved_api_requests is None or _saved_api_requests.directory != directory:
+        _saved_api_requests = SavedApiRequests(directory)
+    return _saved_api_requests.conversation(message_id)
+
+
+def sweep_saved_api_requests(now: Optional[datetime] = None) -> None:
+    """Start a new index each day and drop saved requests and indexes older than a week."""
+    directory = get_saved_api_requests_dir()
+    if directory is None:
+        return
+    now = now or datetime.now(timezone.utc)
+    index = directory / SAVED_API_REQUESTS_INDEX
+    try:
+        with index.open(encoding="utf-8") as f:
+            started = parse_timestamp(json.loads(f.readline()))
+        if started is not None and now - _as_aware(started) > SAVED_API_REQUESTS_INDEX_AGE:
+            index.rename(directory / f"index.{_as_aware(started):%Y%m%dT%H%M%S}.jsonl")
+    except (OSError, ValueError):
+        pass
+    cutoff = (now - SAVED_API_REQUESTS_MAX_AGE).timestamp()
+    try:
+        for path in directory.iterdir():
+            try:
+                if path.name != SAVED_API_REQUESTS_INDEX and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
 # ---- Tool observations ----
 @dataclass
 class ToolResultForObservation:
@@ -3711,6 +3862,10 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             generation_emission_key(assistant_index, assistant_message),
             complete=generation_complete,
         ):
+            saved_input = get_saved_api_request_input(assistant_message)
+            if saved_input is not None:
+                generation_kwargs["input"] = saved_input
+                generation_kwargs["metadata"]["history"] = {"messages": len(saved_input), "source": "saved_api_request"}
             generation_span = emit_generation_observation(
                 langfuse,
                 parent_otel_span=parent_otel_span,
@@ -4768,6 +4923,7 @@ def main() -> int:
     flush_deferred_agent_turns = is_session_end_hook_payload(payload)
     if flush_deferred_agent_turns:
         sweep_stale_context_files()
+        sweep_saved_api_requests()
 
     langfuse = create_langfuse_client(config)
     if langfuse is None:
