@@ -130,7 +130,7 @@ from the working directory), then `~/.claude/agents` (or
 
 ## LLM Call Inputs
 
-Each `LLM Call` input is the conversation the model got for that call. With
+Each `LLM Call` input shows what the model got for that call. With
 
 ```
 OTEL_LOG_RAW_API_BODIES=file:<dir>
@@ -138,14 +138,19 @@ CC_LANGFUSE_API_REQUESTS_DIR=<dir>
 ```
 
 in the `env` of the user settings, Claude Code saves every API request and
-response in `<dir>`, and the input comes from those saved requests: the
-messages exactly as sent, with the system reminders, the context that hooks
-added after a tool call and the messages typed while the agent worked, each at
-the point where the model got it. Claude Code keeps `OTEL_*` variables from
+response in `<dir>`, and the input comes from those saved requests: only the
+messages that are new since the call before it (the whole request for the first
+call of a conversation), exactly as sent, with the system reminders, the context
+that hooks added after a tool call and the messages typed while the agent
+worked, each at the point where the model got it. The earlier messages are the
+inputs and outputs of the earlier calls. `metadata.history` holds `messages`
+(the new ones), `previous_message_id` (the call before, by message id),
+`previous_observation_id` (that call's observation when it is in the same
+turn) and `total_messages` (the whole conversation, when every earlier saved
+request is there). Claude Code keeps `OTEL_*` variables from
 hooks, so the plugin needs the second variable to find `<dir>`. Without the
-settings, or when a saved request
-of the conversation is missing (older sessions, a fork of another session), the
-input is rebuilt from the transcript, which holds the user messages, the
+settings, or when the call's own saved request is missing (older sessions), the
+input is the whole conversation rebuilt from the transcript, which holds the user messages, the
 assistant messages and the tool results only. `metadata.history.source` is
 `saved_api_request` for an input from the saved requests.
 

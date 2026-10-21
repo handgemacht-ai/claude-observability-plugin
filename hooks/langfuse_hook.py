@@ -3287,11 +3287,38 @@ class SavedApiRequests:
         chain_is_usable = calls is not None and is_complete_call_chain(calls)
         return build_conversation_of_calls(calls) if chain_is_usable else None
 
+    def new_messages(self, message_id: str) -> Optional[List[Dict[str, Any]]]:
+        """The messages the request of message_id's call added since the call
+        before it (all of them for a call that starts its thread); None when
+        that request is missing."""
+        request = self.body(self.entry(message_id), "request_file")
+        messages = request.get("messages") if request is not None else None
+        return messages if isinstance(messages, list) else None
+
+    def history(self, message_id: str) -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
+        """The input of message_id's call, its new messages only, and its
+        metadata.history; None when its request is missing."""
+        messages = self.new_messages(message_id)
+        if messages is None:
+            return None
+        request = self.body(self.entry(message_id), "request_file")
+        previous_message_id = get_previous_message_id(request)
+        history: Dict[str, Any] = {"messages": len(messages), "source": "saved_api_request"}
+        if previous_message_id is not None:
+            history["previous_message_id"] = previous_message_id
+        conversation = self.conversation(message_id)
+        if conversation is not None:
+            history["total_messages"] = len(conversation)
+        return messages, history
+
 
 _saved_api_requests: Optional[SavedApiRequests] = None
 
-def get_saved_api_request_input(assistant_message: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    """The input the model got for this assistant message, as Claude Code saved it."""
+def get_saved_api_request_history(
+    assistant_message: Dict[str, Any],
+) -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
+    """What the model got for this assistant message that it had not got for
+    the call before, as Claude Code saved it, with its metadata.history."""
     global _saved_api_requests
     directory = get_saved_api_requests_dir()
     message_id = get_message_id(assistant_message)
@@ -3299,7 +3326,7 @@ def get_saved_api_request_input(assistant_message: Dict[str, Any]) -> Optional[L
         return None
     if _saved_api_requests is None or _saved_api_requests.directory != directory:
         _saved_api_requests = SavedApiRequests(directory)
-    return _saved_api_requests.conversation(message_id)
+    return _saved_api_requests.history(message_id)
 
 
 def sweep_saved_api_requests(now: Optional[datetime] = None) -> None:
@@ -3812,6 +3839,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
     # True once the walk passed an async launch whose final result is still
     # missing; later generations' inputs can then still change retroactively.
     unresolved_async_launch_seen = False
+    turn_message_ids = {get_message_id(message) for message in turn.assistant_msgs} - {None}
 
     for assistant_index, assistant_message in enumerate(turn.assistant_msgs):
         assistant_timestamp = parse_timestamp(assistant_message)
@@ -3862,10 +3890,14 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             generation_emission_key(assistant_index, assistant_message),
             complete=generation_complete,
         ):
-            saved_input = get_saved_api_request_input(assistant_message)
-            if saved_input is not None:
+            saved_history = get_saved_api_request_history(assistant_message)
+            if saved_history is not None:
+                saved_input, history = saved_history
+                previous_message_id = history.get("previous_message_id")
+                if previous_message_id in turn_message_ids:
+                    history["previous_observation_id"] = derive_child_span_id(parent_otel_span, previous_message_id)
                 generation_kwargs["input"] = saved_input
-                generation_kwargs["metadata"]["history"] = {"messages": len(saved_input), "source": "saved_api_request"}
+                generation_kwargs["metadata"]["history"] = history
             generation_span = emit_generation_observation(
                 langfuse,
                 parent_otel_span=parent_otel_span,

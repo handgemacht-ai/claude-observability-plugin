@@ -81,38 +81,81 @@ def save_call(directory: Path, message_id: str, messages: list[Any], content: An
         f.write(json.dumps(entry) + "\n")
 
 
+def generations_of(fake_langfuse: Any) -> list[Any]:
+    return [o for o in fake_langfuse.observations if o.as_type == "generation"]
+
+
 def emit(hook_module: Any, fake_langfuse: Any, transcript: Path) -> list[Any]:
     config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
     hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, transcript)
-    return [o.kwargs for o in fake_langfuse.observations if o.as_type == "generation"]
+    return [o.kwargs for o in generations_of(fake_langfuse)]
 
 
-def test_generation_input_is_the_saved_conversation_with_hook_notes(
+QUESTION = {"role": "user", "content": [{"type": "text", "text": "Question 1?"}]}
+TOOL_RESULT = {"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "toolu-1", "content": "file content"}]}
+
+
+def test_first_call_input_is_its_whole_request(
     hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
 ):
     saved = tmp_path / "saved"
     monkeypatch.setenv("CC_LANGFUSE_API_REQUESTS_DIR", str(saved))
-    question = {"role": "user", "content": [{"type": "text", "text": "Question 1?"}]}
-    tool_result = {"role": "user", "content": [
-        {"type": "tool_result", "tool_use_id": "toolu-1", "content": "file content"}]}
-    save_call(saved, "msg-1-0", [question], TOOL_USE)
-    save_call(saved, "msg-1-1", [tool_result, HOOK_NOTE], ANSWER, previous_message_id="msg-1-0")
+    save_call(saved, "msg-1-0", [QUESTION], TOOL_USE)
+    save_call(saved, "msg-1-1", [TOOL_RESULT, HOOK_NOTE], ANSWER, previous_message_id="msg-1-0")
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    write_transcript(transcript)
+
+    first, _ = emit(hook_module, fake_langfuse, transcript)
+
+    assert first["input"] == [QUESTION]
+    assert first["metadata"]["history"] == {"messages": 1, "source": "saved_api_request", "total_messages": 1}
+
+
+def test_follow_up_input_is_only_what_is_new_with_the_hook_note(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
+):
+    saved = tmp_path / "saved"
+    monkeypatch.setenv("CC_LANGFUSE_API_REQUESTS_DIR", str(saved))
+    save_call(saved, "msg-1-0", [QUESTION], TOOL_USE)
+    save_call(saved, "msg-1-1", [TOOL_RESULT, HOOK_NOTE], ANSWER, previous_message_id="msg-1-0")
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    write_transcript(transcript)
+
+    _, second = emit(hook_module, fake_langfuse, transcript)
+
+    assert second["input"] == [TOOL_RESULT, HOOK_NOTE]
+    assert second["metadata"]["history"] == {
+        "messages": 2,
+        "source": "saved_api_request",
+        "previous_message_id": "msg-1-0",
+        "total_messages": 4,
+        "previous_observation_id": generations_of(fake_langfuse)[0].id,
+    }
+
+
+def test_follow_up_input_is_new_messages_when_an_earlier_saved_call_is_missing(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
+):
+    saved = tmp_path / "saved"
+    monkeypatch.setenv("CC_LANGFUSE_API_REQUESTS_DIR", str(saved))
+    save_call(saved, "msg-1-1", [TOOL_RESULT, HOOK_NOTE], ANSWER, previous_message_id="msg-1-0")
     transcript = tmp_path / f"{SESSION}.jsonl"
     write_transcript(transcript)
 
     first, second = emit(hook_module, fake_langfuse, transcript)
 
-    assert first["input"] == [question]
-    assert second["input"] == [question, {"role": "assistant", "content": TOOL_USE}, tool_result, HOOK_NOTE]
-    assert second["metadata"]["history"] == {"messages": 4, "source": "saved_api_request"}
+    assert first["metadata"]["history"] == {"messages": 1}
+    assert second["input"] == [TOOL_RESULT, HOOK_NOTE]
+    assert "total_messages" not in second["metadata"]["history"]
 
 
-def test_generation_input_is_rebuilt_when_a_saved_call_is_missing(
+def test_generation_input_is_rebuilt_when_its_saved_call_is_missing(
     hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
 ):
     saved = tmp_path / "saved"
     monkeypatch.setenv("CC_LANGFUSE_API_REQUESTS_DIR", str(saved))
-    save_call(saved, "msg-1-1", [HOOK_NOTE], ANSWER, previous_message_id="msg-1-0")
+    save_call(saved, "msg-1-0", [QUESTION], TOOL_USE)
     transcript = tmp_path / f"{SESSION}.jsonl"
     write_transcript(transcript)
 
