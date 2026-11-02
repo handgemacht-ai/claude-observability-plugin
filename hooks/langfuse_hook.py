@@ -544,8 +544,12 @@ def load_hook_state() -> Dict[str, Any]:
     except Exception:
         return {}
 
-def get_session_state_key(session_id: str, transcript_path: str) -> str:
-    # stable key even if session_id collides
+def get_session_state_key(session_id: str) -> str:
+    """The key of a session's state entry: it follows the session, not the path of its log."""
+    return hashlib.sha256(f"session:{session_id}".encode("utf-8")).hexdigest()
+
+def get_legacy_session_state_key(session_id: str, transcript_path: str) -> str:
+    """The key of releases up to 1.3.0-handgemacht.9, which changed with the path of the log."""
     raw = f"{session_id}::{transcript_path}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -572,6 +576,12 @@ class SessionState:
     # Name of the agent the main conversation runs as (--agent / "agent"
     # setting); last known value, used when a firing cannot see it.
     main_agent: str = ""
+    # Where the log was when the state was saved, and a hash of its first
+    # head_len bytes: a log that moves (a session that enters or leaves a
+    # worktree) continues where it stopped when its start is the same.
+    transcript_path: str = ""
+    head_len: int = 0
+    head_hash: str = ""
 
 def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
@@ -593,6 +603,8 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     main_agent = s.get("main_agent")
     if not isinstance(main_agent, str):
         main_agent = ""
+    transcript_path = s.get("transcript_path")
+    head_hash = s.get("head_hash")
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
@@ -603,6 +615,9 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
         turn_numbers=turn_numbers,
         turn_progress=turn_progress,
         main_agent=main_agent,
+        transcript_path=transcript_path if isinstance(transcript_path, str) else "",
+        head_len=int(s.get("head_len", 0)),
+        head_hash=head_hash if isinstance(head_hash, str) else "",
     )
 
 def update_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
@@ -616,8 +631,74 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "turn_numbers": session_state.turn_numbers or {},
         "turn_progress": session_state.turn_progress or {},
         "main_agent": session_state.main_agent or "",
+        "transcript_path": session_state.transcript_path,
+        "head_len": session_state.head_len,
+        "head_hash": session_state.head_hash,
         "updated": datetime.now(timezone.utc).isoformat(),
     }
+
+HEAD_FINGERPRINT_BYTES = 4096
+
+def hash_transcript_head(transcript_path: Path, length: int) -> Optional[str]:
+    """Hash of the first `length` bytes of the log; None when the log is shorter or unreadable."""
+    try:
+        with open(transcript_path, "rb") as f:
+            head = f.read(length)
+    except OSError:
+        return None
+    return hashlib.sha256(head).hexdigest() if len(head) == length else None
+
+def record_transcript_identity(session_state: SessionState, transcript_path: Path) -> None:
+    session_state.transcript_path = str(transcript_path)
+    session_state.head_len = min(session_state.offset, HEAD_FINGERPRINT_BYTES)
+    session_state.head_hash = ""
+    if session_state.head_len:
+        session_state.head_hash = hash_transcript_head(transcript_path, session_state.head_len) or ""
+
+def continues_the_logged_transcript(entry: Dict[str, Any], transcript_path: Path) -> bool:
+    """True when the log at this path is the one the entry was saved for, moved.
+
+    The log starts with the same bytes and holds at least the bytes that were read."""
+    try:
+        offset = int(entry.get("offset", 0))
+        head_len = int(entry.get("head_len", 0))
+        if transcript_path.stat().st_size < offset:
+            return False
+    except (OSError, TypeError, ValueError):
+        return False
+    if head_len <= 0:
+        return offset == 0
+    return hash_transcript_head(transcript_path, head_len) == entry.get("head_hash")
+
+def resolve_session_state_key(
+    state: Dict[str, Any], session_id: str, transcript_path: Path,
+) -> Tuple[str, List[str]]:
+    """The key to read and save a session's state under, and the older keys it replaces.
+
+    Releases up to 1.3.0-handgemacht.9 keyed the state by session and path, so a
+    log that moved sent the whole session again. The state of such a key is taken
+    over by the key of the session. A log that has the session id but another
+    start is another log: it keeps a key of its own, as it always did."""
+    key = get_session_state_key(session_id)
+    legacy_key = get_legacy_session_state_key(session_id, str(transcript_path))
+    legacy_entry = state.get(legacy_key)
+    superseded = [legacy_key] if isinstance(legacy_entry, dict) else []
+    entry = state.get(key)
+    if not isinstance(entry, dict):
+        if superseded:
+            state[key] = legacy_entry
+            info(f"state of session {session_id} moved to the key of the session")
+        return key, superseded
+    recorded_path = entry.get("transcript_path")
+    if not recorded_path or recorded_path == str(transcript_path):
+        return key, superseded
+    if continues_the_logged_transcript(entry, transcript_path):
+        info(f"transcript of session {session_id} moved from {recorded_path} to {transcript_path}; "
+             f"continuing at byte {entry.get('offset', 0)}")
+        return key, superseded
+    info(f"transcript {transcript_path} has the session id {session_id} but not the start of "
+         f"{recorded_path}; its state is kept apart")
+    return legacy_key, []
 
 def sweep_stale_session_locks(state: Dict[str, Any], cutoff: datetime) -> None:
     live = {k[:16] for k in state if isinstance(k, str)}
@@ -4988,11 +5069,10 @@ def emit_new_turns_from_transcript(
     flush_deferred_agent_turns: bool = False,
     payload_agent_type: Optional[str] = None,
 ) -> int:
-    key = get_session_state_key(session_id, str(transcript_path))
-
-    with FileLock(get_session_lock_path(key)):
+    with FileLock(get_session_lock_path(get_session_state_key(session_id))):
         with FileLock(LOCK_FILE):
             state = load_hook_state()
+        key, superseded_keys = resolve_session_state_key(state, session_id, transcript_path)
         session_state = get_session_state(state, key)
 
         subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
@@ -5087,8 +5167,11 @@ def emit_new_turns_from_transcript(
         # duplicate window): progress is persisted before the SDK flush in
         # main(); a dropped flush leaves emitted_keys pointing at spans that
         # never reached the server.
+        record_transcript_identity(session_state, transcript_path)
         with FileLock(LOCK_FILE):
             state = load_hook_state()
+            for superseded_key in superseded_keys:
+                state.pop(superseded_key, None)
             save_session_state(state, key, session_state)
 
     return emitted

@@ -79,7 +79,7 @@ def test_the_session_lock_is_held_across_the_emit(
     same session would read one offset and emit the same turn twice.
     """
     acquired: list[bool] = []
-    key = hook_module.get_session_state_key("session-simple", str(fixture_transcript_path("simple_turn")))
+    key = hook_module.get_session_state_key("session-simple")
 
     def try_session_lock() -> None:
         try:
