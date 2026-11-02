@@ -4700,6 +4700,9 @@ def _read_root_claim(path: Path) -> Optional[Dict[str, Any]]:
 def _process_is_gone(host: Any, pid: Any) -> bool:
     if host != socket.gethostname() or not isinstance(pid, int) or pid <= 0:
         return False
+    if sys.platform == "win32":
+        # os.kill(pid, 0) ends the process on Windows; the age of the claim or note decides there.
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

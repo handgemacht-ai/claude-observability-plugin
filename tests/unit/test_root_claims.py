@@ -175,3 +175,15 @@ def test_the_sweep_removes_old_notes_of_stopped_firings(hook_module, isolated_ho
     hook_module.sweep_stale_context_files()
 
     assert fresh.exists() and not old.exists()
+
+
+def test_a_process_is_never_signalled_to_find_out_whether_it_is_gone_on_windows(hook_module, monkeypatch):
+    # On Windows os.kill ends the process whatever the signal.
+    def kill(pid: int, sig: int) -> None:
+        raise AssertionError("os.kill must not be called")
+
+    gone = a_pid_that_is_gone()
+    monkeypatch.setattr(hook_module.sys, "platform", "win32")
+    monkeypatch.setattr(hook_module.os, "kill", kill)
+
+    assert hook_module._process_is_gone(socket.gethostname(), gone) is False
