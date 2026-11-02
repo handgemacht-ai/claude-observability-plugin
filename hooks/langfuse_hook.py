@@ -1785,15 +1785,16 @@ def get_agent_launch_tool_use_ids_by_name(transcript_path: Path) -> Dict[str, st
         return {}
     return {name: tool_use_id for name, tool_use_id in mapping.items() if name not in ambiguous}
 
-def get_agent_launches_by_agent_id(transcript_path: Path) -> Dict[str, Tuple[str, Dict[str, Any]]]:
-    """Map each agent id to (tool_use id, input) of its launch, read from the
-    launch's tool_result (toolUseResult.agentId).
-    The function streams the full transcript. It removes ambiguous agent ids."""
-    launch_inputs: Dict[str, Dict[str, Any]] = {}
-    mapping: Dict[str, str] = {}
-    ambiguous: set = set()
+LAUNCHING_TOOL_NAMES = ("Agent", "Task", "Skill")
+# A forked skill agent starts within milliseconds of its Skill call. The agent
+# may start this much before the call's row or after its result row and still
+# belong to it, for the rows are not written in one instant.
+SKILL_CALL_START_TOLERANCE = timedelta(seconds=2)
+
+def iter_transcript_rows(transcript_path: Path) -> Iterator[Dict[str, Any]]:
+    """Stream the rows of a transcript; unreadable lines are skipped."""
     try:
-        with transcript_path.open(encoding="utf-8") as lines:
+        with transcript_path.open(encoding="utf-8", errors="replace") as lines:
             for line in lines:
                 line = line.strip()
                 if not line:
@@ -1802,43 +1803,189 @@ def get_agent_launches_by_agent_id(transcript_path: Path) -> Dict[str, Tuple[str
                     row = json.loads(line)
                 except Exception:
                     continue
-                if not isinstance(row, dict):
-                    continue
-                content = get_content_from_row(row)
-                for tool_use in get_tool_use_blocks(content):
-                    if tool_use.get("name") in ("Agent", "Task") and tool_use.get("id"):
-                        tool_input = tool_use.get("input")
-                        launch_inputs[str(tool_use["id"])] = tool_input if isinstance(tool_input, dict) else {}
-                tool_use_result = row.get("toolUseResult")
-                agent_id = tool_use_result.get("agentId") if isinstance(tool_use_result, dict) else None
-                if not isinstance(agent_id, str) or not agent_id:
-                    continue
-                for tool_result_block in get_tool_result_blocks(content):
-                    tool_use_id = str(tool_result_block.get("tool_use_id") or "")
-                    if tool_use_id not in launch_inputs:
-                        continue
-                    if mapping.get(agent_id, tool_use_id) != tool_use_id:
-                        ambiguous.add(agent_id)
-                    mapping[agent_id] = tool_use_id
-    except Exception:
-        return {}
+                if isinstance(row, dict):
+                    yield row
+    except OSError:
+        return
+
+def get_agent_launches_by_agent_id(transcript_path: Path) -> Dict[str, Tuple[str, Dict[str, Any]]]:
+    """Map each agent id to (tool_use id, input) of its launch, read from the
+    launch's tool_result (toolUseResult.agentId). The launching call is an
+    Agent or Task call, or a Skill call that forks an agent.
+    The function streams the full transcript. It removes ambiguous agent ids."""
+    launch_inputs: Dict[str, Dict[str, Any]] = {}
+    mapping: Dict[str, str] = {}
+    ambiguous: set = set()
+    for row in iter_transcript_rows(transcript_path):
+        content = get_content_from_row(row)
+        for tool_use in get_tool_use_blocks(content):
+            if tool_use.get("name") in LAUNCHING_TOOL_NAMES and tool_use.get("id"):
+                tool_input = tool_use.get("input")
+                launch_inputs[str(tool_use["id"])] = tool_input if isinstance(tool_input, dict) else {}
+        tool_use_result = row.get("toolUseResult")
+        agent_id = tool_use_result.get("agentId") if isinstance(tool_use_result, dict) else None
+        if not isinstance(agent_id, str) or not agent_id:
+            continue
+        for tool_result_block in get_tool_result_blocks(content):
+            tool_use_id = str(tool_result_block.get("tool_use_id") or "")
+            if tool_use_id not in launch_inputs:
+                continue
+            if mapping.get(agent_id, tool_use_id) != tool_use_id:
+                ambiguous.add(agent_id)
+            mapping[agent_id] = tool_use_id
     return {
         agent_id: (tool_use_id, launch_inputs[tool_use_id])
         for agent_id, tool_use_id in mapping.items()
         if agent_id not in ambiguous
     }
 
+def get_first_row_timestamp(transcript_path: Path) -> Optional[datetime]:
+    for row in iter_transcript_rows(transcript_path):
+        timestamp = parse_timestamp(row)
+        if timestamp is not None:
+            return timestamp
+    return None
+
+@dataclass
+class SkillCall:
+    tool_use_id: str
+    tool_input: Dict[str, Any]
+    started: Optional[datetime]
+    ended: Optional[datetime] = None
+
+def get_skill_calls(transcript_path: Path) -> List[SkillCall]:
+    """The Skill calls of a transcript with the time each one ran, in call order.
+
+    A skill that forks an agent in the foreground leaves no agent id in the
+    result of its call, so the call and its agent can only be matched by time."""
+    calls: Dict[str, SkillCall] = {}
+    for row in iter_transcript_rows(transcript_path):
+        if get_user_or_assistant_role_from_row(row) is None:
+            continue
+        timestamp = parse_timestamp(row)
+        content = get_content_from_row(row)
+        for tool_use in get_tool_use_blocks(content):
+            tool_use_id = str(tool_use.get("id") or "")
+            if tool_use.get("name") == "Skill" and tool_use_id and tool_use_id not in calls:
+                tool_input = tool_use.get("input")
+                calls[tool_use_id] = SkillCall(
+                    tool_use_id, tool_input if isinstance(tool_input, dict) else {},
+                    _as_aware(timestamp) if timestamp is not None else None,
+                )
+        for tool_result_block in get_tool_result_blocks(content):
+            call = calls.get(str(tool_result_block.get("tool_use_id") or ""))
+            if call is not None and call.ended is None and timestamp is not None:
+                call.ended = _as_aware(timestamp)
+    return list(calls.values())
+
+def match_agents_to_skill_calls(
+    agent_starts: List[Tuple[datetime, str]],
+    calls: List[SkillCall],
+) -> Dict[str, SkillCall]:
+    """Pair each agent that started inside a Skill call with that call.
+
+    An agent takes the earliest call, in call order, that was running when the
+    agent started and that no other agent has taken. A call serves one agent."""
+    matched: Dict[str, SkillCall] = {}
+    taken: set = set()
+    for started, agent_id in sorted(agent_starts, key=lambda item: item[0]):
+        started = _as_aware(started)
+        for call in calls:
+            if call.tool_use_id in taken or call.started is None:
+                continue
+            if started < call.started - SKILL_CALL_START_TOLERANCE:
+                continue
+            if call.ended is not None and started > call.ended + SKILL_CALL_START_TOLERANCE:
+                continue
+            taken.add(call.tool_use_id)
+            matched[agent_id] = call
+            break
+    return matched
+
+def is_plain_file_name(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and value not in (".", "..") and value == Path(value).name
+
+def find_agent_transcript(subagent_dir: Path, agent_id: Any) -> Optional[Path]:
+    """The transcript of an agent: flat in subagents/, or in the run directory of a Workflow agent.
+
+    The agent id comes from transcript data and makes a path, so only a plain
+    name is accepted."""
+    if not is_plain_file_name(agent_id):
+        return None
+    name = f"agent-{agent_id}.jsonl"
+    flat = subagent_dir / name
+    if flat.is_file():
+        return flat
+    try:
+        return next(iter(sorted((subagent_dir / "workflows").glob(f"*/{name}"))), None)
+    except OSError:
+        return None
+
+def describe_skill_call(tool_input: Dict[str, Any]) -> Optional[str]:
+    skill = tool_input.get("skill")
+    if not isinstance(skill, str) or not skill:
+        return None
+    args = tool_input.get("args")
+    return f"/{skill} {args}".strip() if isinstance(args, str) else f"/{skill}"
+
 def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
-    """Map launching Agent/Task tool_use ids to their subagent transcripts."""
+    """Map launching tool_use ids to their subagent transcripts.
+
+    Every depth lives flat in subagents/, and Workflow agents in
+    subagents/workflows/<run>/. A meta names its launching call (toolUseId), or
+    the launch is found in the transcript of the agent that started the agent
+    (parentAgentId, or the main transcript): the Agent, Task or Skill call whose
+    result names the agent id, or the Skill call that was running when a forked
+    skill agent started."""
     subagent_dir = transcript_path.with_suffix("") / "subagents"
     if not subagent_dir.is_dir():
         return {}
 
-    # Build the fallback map only when a meta has no toolUseId.
+    # The fallback maps are built only when a meta has no toolUseId.
     fallback_tool_use_ids: Optional[Dict[str, str]] = None
-    fallback_launches_by_agent_id: Optional[Dict[str, Tuple[str, Dict[str, Any]]]] = None
+    launches_by_launcher: Dict[Path, Dict[str, Tuple[str, Dict[str, Any]]]] = {}
+
+    def launches_in(launcher_path: Path) -> Dict[str, Tuple[str, Dict[str, Any]]]:
+        if launcher_path not in launches_by_launcher:
+            launches_by_launcher[launcher_path] = get_agent_launches_by_agent_id(launcher_path)
+        return launches_by_launcher[launcher_path]
+
     claimed_twice: set = set()
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]] = {}
+    # Forked skill agents of one launching agent that no result names, by launcher transcript.
+    unlinked_by_launcher: Dict[Path, List[Dict[str, Any]]] = {}
+
+    def build_entry(metadata: Dict[str, Any], jsonl_path: Path, agent_id: str,
+                    tool_use_id: str) -> Dict[str, Any]:
+        subagent_entry: Dict[str, Any] = {
+            "path": jsonl_path,
+            "agent_id": agent_id,
+            "agent_type": metadata.get("agentType"),
+            "description": metadata.get("description"),
+            "tool_use_id": tool_use_id,
+        }
+        # spawnDepth and parentAgentId (depth >= 2 only) record where the agent hangs in the tree.
+        for meta_key, entry_key in (
+            ("spawnDepth", "spawn_depth"),
+            ("parentAgentId", "parent_agent_id"),
+            ("model", "model"),
+            ("name", "name"),
+        ):
+            value = metadata.get(meta_key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool) and value != "":
+                subagent_entry[entry_key] = value
+        return subagent_entry
+
+    def add_entry(meta_path: Path, entry: Dict[str, Any]) -> None:
+        tool_use_id = entry["tool_use_id"]
+        if tool_use_id in claimed_twice or tool_use_id in subagent_transcripts_by_tool_use_id:
+            # Two metas claim one launch -> Drop both.
+            claimed_twice.add(tool_use_id)
+            subagent_transcripts_by_tool_use_id.pop(tool_use_id, None)
+            info(f"multiple subagent metas claim tool_use {tool_use_id}, skipping: {meta_path}")
+            return
+        subagent_transcripts_by_tool_use_id[tool_use_id] = entry
+
     for meta_path in sorted(subagent_dir.glob("*.meta.json")):
         try:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1853,52 +2000,71 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
         jsonl_path, agent_id = resolved
 
         tool_use_id = metadata.get("toolUseId")
+        attributed_by: Optional[str] = None
         if not isinstance(tool_use_id, str) or not tool_use_id:
             if fallback_tool_use_ids is None:
                 fallback_tool_use_ids = get_agent_launch_tool_use_ids_by_name(transcript_path)
             # A teammate meta carries the launch input.name.
             name = metadata.get("name")
             tool_use_id = fallback_tool_use_ids.get(name) if isinstance(name, str) else None
+        launch_input: Dict[str, Any] = {}
+        parent_path: Optional[Path] = None
         if not tool_use_id:
-            # A meta rewritten at a resume can lose toolUseId; the launch result names the agent id.
-            if fallback_launches_by_agent_id is None:
-                fallback_launches_by_agent_id = get_agent_launches_by_agent_id(transcript_path)
-            tool_use_id, launch_input = fallback_launches_by_agent_id.get(agent_id, ("", {}))
+            # A meta rewritten at a resume can lose toolUseId, and an agent that another
+            # agent started has none. The result of the launching call names the agent id;
+            # it sits in the transcript of the agent that started it, else in the main one.
+            parent_path = find_agent_transcript(subagent_dir, metadata.get("parentAgentId"))
+            for launcher_path in ([parent_path] if parent_path is not None else []) + [transcript_path]:
+                tool_use_id, launch_input = launches_in(launcher_path).get(agent_id, ("", {}))
+                if tool_use_id:
+                    attributed_by = "launch_result" if launcher_path is not transcript_path else None
+                    break
+        if not tool_use_id and parent_path is not None:
+            unlinked_by_launcher.setdefault(parent_path, []).append(
+                {"meta_path": meta_path, "metadata": metadata, "path": jsonl_path, "agent_id": agent_id}
+            )
+            continue
+        if not tool_use_id:
+            info(f"subagent transcript not attributable to a launching tool_use, skipping: {meta_path}")
+            continue
+        if launch_input:
             # The rewritten meta lost the label too; the launch input has it.
             metadata = {
                 **metadata,
                 "agentType": launch_input.get("subagent_type") or metadata.get("agentType"),
-                "description": launch_input.get("description") or metadata.get("description"),
+                "description": (
+                    launch_input.get("description") or metadata.get("description")
+                    or describe_skill_call(launch_input)
+                ),
             }
-        if not tool_use_id:
-            info(f"subagent transcript not attributable to a launching tool_use, skipping: {meta_path}")
-            continue
-        if tool_use_id in claimed_twice or tool_use_id in subagent_transcripts_by_tool_use_id:
-            # Two metas claim one launch -> Drop both.
-            claimed_twice.add(tool_use_id)
-            subagent_transcripts_by_tool_use_id.pop(tool_use_id, None)
-            info(f"multiple subagent metas claim tool_use {tool_use_id}, skipping: {meta_path}")
-            continue
+        entry = build_entry(metadata, jsonl_path, agent_id, tool_use_id)
+        if attributed_by:
+            entry["attributed_by"] = attributed_by
+        add_entry(meta_path, entry)
 
-        subagent_entry: Dict[str, Any] = {
-            "path": jsonl_path,
-            "agent_id": agent_id,
-            "agent_type": metadata.get("agentType"),
-            "description": metadata.get("description"),
-            "tool_use_id": tool_use_id,
-        }
-        # Every depth lives flat in this directory; spawnDepth and
-        # parentAgentId (depth >= 2 only) record where it hangs in the tree.
-        for meta_key, entry_key in (
-            ("spawnDepth", "spawn_depth"),
-            ("parentAgentId", "parent_agent_id"),
-            ("model", "model"),
-            ("name", "name"),
-        ):
-            value = metadata.get(meta_key)
-            if isinstance(value, (str, int)) and not isinstance(value, bool) and value != "":
-                subagent_entry[entry_key] = value
-        subagent_transcripts_by_tool_use_id[tool_use_id] = subagent_entry
+    for launcher_path, unlinked in unlinked_by_launcher.items():
+        starts: List[Tuple[datetime, str]] = []
+        for item in unlinked:
+            started = get_first_row_timestamp(item["path"])
+            if started is not None:
+                starts.append((started, item["agent_id"]))
+        free_calls = [
+            call for call in get_skill_calls(launcher_path)
+            if call.tool_use_id not in subagent_transcripts_by_tool_use_id
+        ]
+        calls_by_agent = match_agents_to_skill_calls(starts, free_calls)
+        for item in unlinked:
+            call = calls_by_agent.get(item["agent_id"])
+            if call is None:
+                info(f"subagent transcript not attributable to a launching tool_use, skipping: {item['meta_path']}")
+                continue
+            metadata = {
+                **item["metadata"],
+                "description": item["metadata"].get("description") or describe_skill_call(call.tool_input),
+            }
+            entry = build_entry(metadata, item["path"], item["agent_id"], call.tool_use_id)
+            entry["attributed_by"] = "skill_call_time"
+            add_entry(item["meta_path"], entry)
     return subagent_transcripts_by_tool_use_id
 
 def get_workflow_journal_results(run_dir: Path) -> Dict[str, Any]:
@@ -4105,7 +4271,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
         "transcript_path": get_short_transcript_path_for_metadata(path),
         "user_text": subagent_input_meta,
     }
-    for key in ("spawn_depth", "parent_agent_id", "model", "name"):
+    for key in ("spawn_depth", "parent_agent_id", "model", "name", "attributed_by"):
         if subagent.get(key) not in (None, ""):
             subagent_metadata[key] = subagent[key]
     if nesting.ancestry:
