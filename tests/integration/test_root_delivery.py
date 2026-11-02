@@ -108,6 +108,30 @@ def test_the_turns_of_a_firing_that_did_not_arrive_are_sent_with_the_next_ones(h
     assert asked.count("Question 1?") == 1
 
 
+def test_a_session_that_still_has_its_state_under_the_old_key_is_not_sent_again_after_a_lost_firing(
+    hook, hook_module, fake_langfuse
+):
+    # The firing that moves the state to the key of the session is lost: the old entry
+    # must come back whole, not be replaced by an empty one under the new key.
+    append(hook.transcript, question(1) + question(2))
+    hook.stop(hook_module.DELIVERED)
+    state = state_entries(hook_module)
+    session_key = hook_module.get_session_state_key(SESSION)
+    legacy_key = hook_module.get_legacy_session_state_key(SESSION, str(hook.transcript))
+    legacy_entry = {k: v for k, v in state[session_key].items() if k not in ("transcript_path", "head_len", "head_hash")}
+    hook_module.STATE_FILE.write_text(json.dumps({legacy_key: legacy_entry}), encoding="utf-8")
+    append(hook.transcript, question(3))
+
+    hook.stop(hook_module.LOST)
+    hook.stop(hook_module.DELIVERED)
+
+    asked = [o.kwargs["input"]["content"] for o in roots(fake_langfuse)]
+    assert asked.count("Question 1?") == 1
+    assert asked.count("Question 2?") == 1
+    assert asked.count("Question 3?") == 2, "the third question was lost once and sent again"
+    assert list(state_entries(hook_module)) == [session_key]
+
+
 def test_a_batch_that_langfuse_refused_is_not_sent_again_but_does_not_block_the_root(
     hook, hook_module, fake_langfuse
 ):
