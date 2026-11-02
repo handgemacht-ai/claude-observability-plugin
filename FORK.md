@@ -7,7 +7,9 @@ Everything else works as described in the [README](./README.md).
 
 - **Agents at any depth**: each subagent, Workflow-spawned agent and resumed
   agent run nests under the tool call that started it, including agents that
-  subagents start themselves.
+  subagents start themselves. An agent that a forked skill starts, whose
+  transcript opens with the skill text as an injected (`isMeta`) user row, runs
+  under that text as its prompt.
 - **Agent names**: the main agent (`--agent` or the `agent` setting) and each
   subagent type show up in observation names, the trace name, tags and metadata.
 - **One trace per request**: a message continues the current trace when the
@@ -18,6 +20,15 @@ Everything else works as described in the [README](./README.md).
   observation is sent when the request really ends, so after a question stop and
   a reply it shows the final answer and the last stop's end time; a request that
   ends on a question sends its root when the session ends.
+- **Only chat rows are messages**: Claude Code 2.1.300 and later write log
+  rows of its own into the transcript, `api-request`, `api-request-blob` and
+  `api-request-shape`. A blob row carries a `message.role` (user, assistant or
+  system) and no uuid or timestamp, because it is a copy of a message of a saved
+  API request. The hook takes a row for a message only when its `type` is `user`
+  or `assistant` (a row with no `type` at all still takes the role of its
+  `message`), so these rows, and any log row type Claude Code adds later, start
+  no request, add no step and give no tool result. The rows stay in the rows
+  that are read; the hook only does not turn them into messages.
 - **One root per trace**: the first plugin process to send a trace's root leaves
   a claim file in `~/.claude/state/langfuse_root_claims`; any other process that
   reads the same transcript (for example through a different state directory)
@@ -48,6 +59,11 @@ Everything else works as described in the [README](./README.md).
     same rule (their message ids and tool ids are unique), in the trace of the
     main request. The `Subagent: ...`, `Workflow agent: ...` and `Instructions`
     observations still get random ids.
+  - The formulas hold on Claude Code 2.1.300 and later too: a request starts
+    at the real user row, so its trace id comes from that row's uuid, and every
+    step is counted once (see "Only chat rows are messages"). With release
+    `1.3.0-handgemacht.8` and earlier, most requests on those versions started
+    at a copy in a blob row, which has no uuid and so got a random trace id.
   - `tests/fixtures/span_ids.json` holds transcripts with the trace id and the
     span ids they must give, for checking another implementation.
 - **Instructions and system prompts**: each agent carries an `Instructions`
@@ -153,6 +169,10 @@ settings, or when the call's own saved request is missing (older sessions), the
 input is the whole conversation rebuilt from the transcript, which holds the user messages, the
 assistant messages and the tool results only. `metadata.history.source` is
 `saved_api_request` for an input from the saved requests.
+
+The input comes from the files in `<dir>` only. The `api-request` and
+`api-request-blob` rows in the transcript itself are not read, and do not
+change the input.
 
 At the end of a session, the plugin starts a new `index.jsonl` in `<dir>` when
 the current one is older than a day, and removes saved requests and old
