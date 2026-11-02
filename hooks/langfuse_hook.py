@@ -675,12 +675,19 @@ def get_content_from_row(row: Dict[str, Any]) -> Any:
         return message.get("content")
     return row.get("content")
 
+CHAT_ROW_TYPES = ("user", "assistant")
+
 def get_user_or_assistant_role_from_row(row: Dict[str, Any]) -> Optional[str]:
-    # Claude Code transcript row format is internal. Prefer top-level row.type
-    # when it marks a chat row, then fall back to nested message.role.
+    # Claude Code transcript row format is internal. A row that names its type
+    # is a chat row only for CHAT_ROW_TYPES. Other types are Claude Code's own
+    # log rows, even with a message.role: api-request-blob copies the messages
+    # of a saved API request (roles user, assistant, system; no uuid, no
+    # timestamp). Only a row without a type falls back to nested message.role.
     row_type = row.get("type")
-    if row_type in ("user", "assistant"):
+    if row_type in CHAT_ROW_TYPES:
         return row_type
+    if isinstance(row_type, str) and row_type:
+        return None
 
     message = row.get("message")
     if isinstance(message, dict):
@@ -2132,6 +2139,20 @@ def rows_before_later_runs(rows: List[Dict[str, Any]], visible_until: Any) -> Li
             return rows[:index]
     return rows
 
+def promote_opening_meta_prompt(run_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Let a run start at its opening isMeta prompt.
+
+    The coordinator's message that resumes a stopped agent, and the skill text a
+    forked skill agent starts with, are isMeta rows: no human typed them, and
+    the run has no other prompt row to start its turn at.
+    """
+    if not run_rows or not is_prompt_row(run_rows[0]) or not run_rows[0].get("isMeta"):
+        return run_rows
+    promoted = dict(run_rows[0])
+    promoted.pop("isMeta", None)
+    return [promoted] + run_rows[1:]
+
+
 def select_agent_run_rows(
     subagent: Dict[str, Any],
     rows: List[Dict[str, Any]],
@@ -2139,13 +2160,13 @@ def select_agent_run_rows(
     """Cut one run out of an agent transcript.
 
     Returns (run rows, run index, end index of the run in rows). Run 0 is
-    the launch; run k is the k-th resume. The first row of a resumed run is
-    the coordinator's isMeta message, promoted to the run's prompt.
+    the launch; run k is the k-th resume. The first row of a run that opens
+    with an isMeta prompt is promoted to the run's prompt.
     """
     rows = rows_before_later_runs(rows, subagent.get("visible_until"))
     resume_starts = [s for s in (subagent.get("resume_starts") or []) if isinstance(s, datetime)]
     if not resume_starts:
-        return rows, 0, len(rows)
+        return promote_opening_meta_prompt(rows), 0, len(rows)
     cuts = [0]
     for resume_start in resume_starts:
         cuts.append(find_resumed_run_start(rows, resume_start, min(cuts[-1] + 1, len(rows))))
@@ -2153,11 +2174,7 @@ def select_agent_run_rows(
     run_index = 0
     if is_resumed_run_entry(subagent) and subagent["resume_start"] in resume_starts:
         run_index = resume_starts.index(subagent["resume_start"]) + 1
-    run_rows = rows[cuts[run_index]:cuts[run_index + 1]]
-    if run_index and run_rows and is_prompt_row(run_rows[0]) and run_rows[0].get("isMeta"):
-        promoted = dict(run_rows[0])
-        promoted.pop("isMeta", None)
-        run_rows = [promoted] + run_rows[1:]
+    run_rows = promote_opening_meta_prompt(rows[cuts[run_index]:cuts[run_index + 1]])
     return run_rows, run_index, cuts[run_index + 1]
 
 
