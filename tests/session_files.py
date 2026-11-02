@@ -2,12 +2,25 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 SESSION = "session-launches"
 BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def a_pid_that_is_gone() -> int:
+    pid = 4_000_000
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return pid
+        except OSError:
+            pass
+        pid += 1
 
 
 def stamp(seconds: float) -> str:
