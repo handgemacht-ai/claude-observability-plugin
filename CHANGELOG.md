@@ -17,7 +17,7 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
 [PR #11](https://github.com/handgemacht-ai/claude-observability-plugin/pull/11), on top of PR #10. Commits in landing order:
 `8058c18` (helpers of helpers), `eb3e042` (state that follows the session), `83f02ec` (root claims and delivery), `fea646f`
 (`FORK.md`), `92b0b48` (version), `6b6ea41` (the first version of this entry), `10967af` (an undone firing that moved state keeps the old
-entry), `74a9a19` (firings stopped before they knew the outcome), `b6749fd` (no signal to a process on Windows), and the commit that brings `FORK.md` and this entry up to date. Each of the
+entry), `74a9a19` (firings stopped before they knew the outcome), `b6749fd` (no signal to a process on Windows), the commit that brings `FORK.md` and this entry up to date, and the commit that gives the firing note a random part in its name. Each of the
 code commits has its own tests and works on its own. "Before" in this entry is release `1.3.0-handgemacht.9`.
 
 **What changed**
@@ -54,7 +54,7 @@ code commits has its own tests and works on its own. "Before" in this entry is r
 - **A firing that is stopped before it knows the outcome is sent again.** A firing saves its progress before the flush, and Claude Code stops a
   `SessionEnd` hook after 1.5 seconds in total. A flush to a Langfuse that is down takes longer (3.4 to 3.8 seconds in the tests below), so the
   `SessionEnd` firing was stopped after its state said the turns were sent and before it could see that they were not: no verdict, no undo, and a session
-  that was resumed afterwards never sent its first request. The firing now leaves a note, `langfuse_firing.<session>.<pid>.json` in the state folder,
+  that was resumed afterwards never sent its first request. The firing now leaves a note, `langfuse_firing.<session>.<pid>-<random>.json` in the state folder (the random part keeps a process that got the pid of a stopped one from writing over its note),
   with the state as it was, before it saves its progress, and removes it when it knows the outcome. The next firing of the session puts the state back from
   every note whose process is gone, or that is older than 15 minutes (`FIRING_NOTE_MAX_AGE`), the newest note first so that the oldest state comes back
   last, and counts it in the same three tries in a row. The claims of the stopped firing are `pending` and its process is gone, so they are taken over

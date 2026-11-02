@@ -81,8 +81,8 @@ def stopped_firing(hook_module: Any, fake_langfuse: Any, transcript: Path, *, pr
     hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, transcript, firing=firing)
     hook_module.SENT_ROOT_CLAIMS.clear()
     pid = a_pid_that_is_gone() if process_is_gone else os.getppid()
-    # Every firing of a real process has a note of its own; in this test they all share one pid.
-    note = firing.note_path.rename(firing.note_path.with_name(f"{firing.note_path.name}.{len(firing_notes(hook_module))}.json"))
+    # The firings of this test all share one pid, as a process does that gets the pid of a stopped one.
+    note = firing.note_path
     claim_files = list(hook_module.ROOT_CLAIM_DIR.iterdir()) if hook_module.ROOT_CLAIM_DIR.exists() else []
     for path in [note, *claim_files]:
         content = json.loads(path.read_text(encoding="utf-8"))
@@ -237,7 +237,7 @@ def test_a_firing_that_knows_what_became_of_its_spans_leaves_no_note(hook, hook_
 
 def test_a_note_that_cannot_be_written_does_not_stop_the_firing(hook, hook_module, fake_langfuse, monkeypatch):
     append(hook.transcript, question(1))
-    monkeypatch.setattr(hook_module, "FIRING_NOTE_PATTERN", "no-such-folder/{session}.{pid}")
+    monkeypatch.setattr(hook_module, "FIRING_NOTE_PATTERN", "no-such-folder/{session}.{writer}")
 
     hook.stop(hook_module.DELIVERED)
 
