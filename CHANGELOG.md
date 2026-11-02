@@ -15,9 +15,10 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
 ### Helpers of helpers are sent, a moved log is not sent twice, a lost root is sent again (release 1.3.0-handgemacht.10)
 
 [PR #11](https://github.com/handgemacht-ai/claude-observability-plugin/pull/11), on top of PR #10. Commits in landing order:
-`8058c18` (helpers of helpers), `eb3e042` (state that follows the session), `83f02ec` (root claims and delivery), `fea646f`
-(`FORK.md`), `92b0b48` (version), `6b6ea41` (the first version of this entry), `10967af` (an undone firing that moved state keeps the old
-entry), `74a9a19` (firings stopped before they knew the outcome), `b6749fd` (no signal to a process on Windows), the commit that brings `FORK.md` and this entry up to date, and the commit that gives the firing note a random part in its name. Each of the
+`3f15a4b` (helpers of helpers), `dc6700e` (state that follows the session), `f19253b` (root claims and delivery), `cbd351b`
+(`FORK.md`), `d0eee67` (version), `a903675` (the first version of this entry), `8f75766` (an undone firing that moved state keeps the old
+entry), `9017a6a` (firings stopped before they knew the outcome), `4b99b59` (no signal to a process on Windows), `674db65` (`FORK.md` and
+this entry up to date) and `4180e33` (a random part in the name of the firing note). Each of the
 code commits has its own tests and works on its own. "Before" in this entry is release `1.3.0-handgemacht.9`.
 
 **What changed**
@@ -133,8 +134,8 @@ code commits has its own tests and works on its own. "Before" in this entry is r
 
 ### Claude Code's request log rows are no longer taken for messages (release 1.3.0-handgemacht.9)
 
-[PR #10](https://github.com/handgemacht-ai/claude-observability-plugin/pull/10), commits in landing order: `1352914`
-(the fix, specs and FORK.md), `2192672` (version), and the commit that adds this entry.
+[PR #10](https://github.com/handgemacht-ai/claude-observability-plugin/pull/10), commits in landing order: `960ecf6`
+(the fix, specs and FORK.md), `36f09cc` (version) and `a025b78` (this entry).
 
 **What changed**
 - A row of the session log is a message only when its `type` is `user` or `assistant` (`CHAT_ROW_TYPES`, in
