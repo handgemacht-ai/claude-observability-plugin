@@ -12,10 +12,12 @@ Claude Code -> Langfuse hook
 
 import base64
 import contextlib
+import copy
 import json
 import logging
 import os
 import random
+import socket
 import sys
 import threading
 import time
@@ -2839,7 +2841,7 @@ CONTEXT_FILE_MAX_AGE = timedelta(days=30)
 def sweep_stale_context_files(now: Optional[datetime] = None) -> None:
     """Drop InstructionsLoaded/SessionStart record files of long-gone sessions."""
     cutoff = ((now or datetime.now(timezone.utc)) - CONTEXT_FILE_MAX_AGE).timestamp()
-    for directory, pattern in ((STATE_DIR / CONTEXT_DIR_NAME, "*.jsonl"), (ROOT_CLAIM_DIR, "*.claim")):
+    for directory, pattern in ((STATE_DIR / CONTEXT_DIR_NAME, "*.jsonl"), (ROOT_CLAIM_DIR, "*.claim*")):
         try:
             for path in directory.glob(pattern):
                 try:
@@ -4667,28 +4669,129 @@ def forced_next_span_id(langfuse: Langfuse, span_id_hex: Optional[str]) -> Itera
         tracer.id_generator = real
 
 
-def claim_turn_root(trace_id: Optional[str]) -> bool:
+# A root claim says who sends a trace's root. It starts as "pending" and turns
+# "sent" once the hook has seen its spans delivered. A claim without content is
+# one of a release up to 1.3.0-handgemacht.9: it counts as sent.
+ROOT_CLAIM_PENDING_MAX_AGE = timedelta(minutes=15)
+
+@dataclass
+class RootClaim:
+    path: Optional[Path]
+    token: str
+
+# The roots this process sent, to be confirmed or released once the flush is known.
+SENT_ROOT_CLAIMS: List[RootClaim] = []
+
+def _read_root_claim(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {}
+    try:
+        content = json.loads(text)
+    except ValueError:
+        return {}
+    return content if isinstance(content, dict) else {}
+
+def _process_is_gone(host: Any, pid: Any) -> bool:
+    if host != socket.gethostname() or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+def _root_claim_is_stale(content: Dict[str, Any]) -> bool:
+    """A pending claim whose process is gone, or that is older than a hook can run, blocks nothing."""
+    if content.get("state") != "pending":
+        return False
+    if _process_is_gone(content.get("host"), content.get("pid")):
+        return True
+    claimed_at = parse_timestamp(content.get("claimed_at"))
+    return claimed_at is None or datetime.now(timezone.utc) - _as_aware(claimed_at) > ROOT_CLAIM_PENDING_MAX_AGE
+
+def _write_root_claim(path: Path, token: str, state: str, *, exclusive: bool) -> None:
+    content = json.dumps({
+        "state": state, "token": token, "pid": os.getpid(), "host": socket.gethostname(),
+        "claimed_at": datetime.now(timezone.utc).isoformat(),
+    })
+    if exclusive:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as claim_file:
+            claim_file.write(content)
+        return
+    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(content, encoding="utf-8")
+    os.replace(temporary, path)
+
+def claim_turn_root(trace_id: Optional[str]) -> Optional[RootClaim]:
     """Take the one right to send this trace's root.
 
     Plugin processes that read the same transcript through different state
     directories each see the turn as new; the first to claim it sends the
-    root and the others leave it out. Fails open: when the claim cannot be
-    written, the root is sent.
+    root and the others leave it out. A claim blocks the others only while it
+    can still become a sent root: a claim of a process that is gone, or one
+    that stayed pending longer than a hook can run, is taken over. Fails
+    open: when the claim cannot be written, the root is sent.
     """
+    token = f"{os.getpid()}-{random.getrandbits(32):08x}"
     if not trace_id:
-        return True
+        return RootClaim(None, token)
     try:
         ROOT_CLAIM_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         debug(f"root claim directory unusable, sending the root anyway: {e}")
-        return True
-    try:
-        os.close(os.open(ROOT_CLAIM_DIR / f"{trace_id}.claim", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-    except FileExistsError:
-        return False
-    except OSError as e:
-        debug(f"root claim for {trace_id} failed, sending the root anyway: {e}")
-    return True
+        return RootClaim(None, token)
+    path = ROOT_CLAIM_DIR / f"{trace_id}.claim"
+    for _ in range(2):
+        try:
+            _write_root_claim(path, token, "pending", exclusive=True)
+            return RootClaim(path, token)
+        except FileExistsError:
+            content = _read_root_claim(path)
+            if content is None:
+                continue
+            if not _root_claim_is_stale(content):
+                return None
+            info(f"root claim of trace {trace_id} is stale; taking it over")
+            taken_over = path.with_name(f"{path.name}.stale-{os.getpid()}")
+            try:
+                os.rename(path, taken_over)
+            except OSError:
+                return None
+            with contextlib.suppress(OSError):
+                taken_over.unlink()
+        except OSError as e:
+            debug(f"root claim for {trace_id} failed, sending the root anyway: {e}")
+            return RootClaim(None, token)
+    return None
+
+def _owned_root_claim(claim: RootClaim) -> bool:
+    content = _read_root_claim(claim.path) if claim.path is not None else None
+    return bool(content) and content.get("token") == claim.token
+
+def release_root_claim(claim: RootClaim) -> None:
+    """Give the right to send the root back, so another send is not blocked."""
+    if claim.path is not None and _owned_root_claim(claim):
+        with contextlib.suppress(OSError):
+            claim.path.unlink()
+
+def confirm_root_claim(claim: RootClaim) -> None:
+    if claim.path is not None and _owned_root_claim(claim):
+        with contextlib.suppress(OSError):
+            _write_root_claim(claim.path, claim.token, "sent", exclusive=False)
+
+def settle_root_claims(delivered: bool) -> None:
+    """Make the claims of the roots this process sent final, or release them when delivery failed."""
+    claims = list(SENT_ROOT_CLAIMS)
+    SENT_ROOT_CLAIMS.clear()
+    for claim in claims:
+        (confirm_root_claim if delivered else release_root_claim)(claim)
 
 
 def turn_waits_for_user_reply(turn: Turn) -> bool:
@@ -4697,11 +4800,17 @@ def turn_waits_for_user_reply(turn: Turn) -> bool:
 
 def end_turn_root(root_span: Any, turn: Turn, obs_end_ts: Optional[datetime]) -> None:
     """Send the root with the output and end time known now; sent spans are immutable."""
-    if not claim_turn_root(getattr(root_span, "trace_id", None)):
+    claim = claim_turn_root(getattr(root_span, "trace_id", None))
+    if claim is None:
         info(f"root of trace {root_span.trace_id} already sent by another process; not sending a second")
         return
-    root_span.update(output=build_turn_output_payload(turn))
-    root_span.end(end_time=to_otel_nanoseconds(get_root_span_end_time(turn, obs_end_ts)))
+    try:
+        root_span.update(output=build_turn_output_payload(turn))
+        root_span.end(end_time=to_otel_nanoseconds(get_root_span_end_time(turn, obs_end_ts)))
+    except BaseException:
+        release_root_claim(claim)
+        raise
+    SENT_ROOT_CLAIMS.append(claim)
 
 
 def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
@@ -5060,6 +5169,52 @@ def emit_ready_observations_of_open_turn(
     except Exception as e:
         info(f"emitting ready observations of open turn failed: {type(e).__name__}: {e}")
 
+@dataclass
+class FiringRecord:
+    """What one firing saved, so a firing whose spans did not arrive can be undone."""
+    session_id: str = ""
+    # State entries as they were before the firing, by key; None where there was none.
+    before: Dict[str, Optional[Dict[str, Any]]] = field(default_factory=dict)
+    saved: bool = False
+
+# A firing whose spans did not arrive is sent again by the next one, up to this
+# many times in a row; then the hook goes on, so a server that stays unreachable
+# or refuses every request does not make each firing slower.
+MAX_UNCONFIRMED_FIRINGS = 3
+
+def undo_unconfirmed_firing(firing: FiringRecord) -> None:
+    """Put the state back as it was before a firing whose spans did not arrive.
+
+    The next firing then reads the same rows again and sends the same turns. A
+    span has the same id each time, so one that did arrive after all appears
+    twice under one id."""
+    if not firing.saved:
+        return
+    with FileLock(LOCK_FILE):
+        state = load_hook_state()
+        attempts = max(
+            (entry.get("unconfirmed_firings", 0) for entry in firing.before.values()
+             if isinstance(entry, dict) and isinstance(entry.get("unconfirmed_firings"), int)),
+            default=0,
+        )
+        if attempts >= MAX_UNCONFIRMED_FIRINGS:
+            info(f"spans of session {firing.session_id} did not arrive {attempts + 1} times in a row; "
+                 f"going on without sending them again")
+            return
+        session_key = get_session_state_key(firing.session_id)
+        for key, entry in firing.before.items():
+            if entry is not None:
+                state[key] = {**entry, "unconfirmed_firings": attempts + 1}
+            elif key == session_key:
+                # A session that had no state yet starts from the beginning, with the count of tries.
+                state[key] = {"unconfirmed_firings": attempts + 1, "updated": datetime.now(timezone.utc).isoformat()}
+            else:
+                state.pop(key, None)
+        save_hook_state(state)
+    info(f"spans of session {firing.session_id} did not arrive; the next firing sends them again "
+         f"(try {attempts + 2} of {MAX_UNCONFIRMED_FIRINGS + 1})")
+
+
 def emit_new_turns_from_transcript(
     langfuse: Langfuse,
     config: LangfuseConfig,
@@ -5068,10 +5223,20 @@ def emit_new_turns_from_transcript(
     *,
     flush_deferred_agent_turns: bool = False,
     payload_agent_type: Optional[str] = None,
+    firing: Optional[FiringRecord] = None,
 ) -> int:
     with FileLock(get_session_lock_path(get_session_state_key(session_id))):
         with FileLock(LOCK_FILE):
             state = load_hook_state()
+        if firing is not None:
+            firing.session_id = session_id
+            firing.before = {
+                state_key: copy.deepcopy(state.get(state_key)) if isinstance(state.get(state_key), dict) else None
+                for state_key in (
+                    get_session_state_key(session_id),
+                    get_legacy_session_state_key(session_id, str(transcript_path)),
+                )
+            }
         key, superseded_keys = resolve_session_state_key(state, session_id, transcript_path)
         session_state = get_session_state(state, key)
 
@@ -5173,15 +5338,85 @@ def emit_new_turns_from_transcript(
             for superseded_key in superseded_keys:
                 state.pop(superseded_key, None)
             save_session_state(state, key, session_state)
+        if firing is not None:
+            firing.saved = True
 
     return emitted
 
 
-def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
-    if langfuse is None:
-        return
+FLUSH_TIMEOUT_SECONDS = 5.0
 
-    # Cap flush+shutdown at 5s so a slow/unreachable Langfuse can't stall Claude Code.
+# What became of the spans a process sent. "lost": a batch failed or did not
+# finish, so sending it again can work. "refused": Langfuse answered with an
+# error that sending again does not change (a wrong key, a batch that is too big).
+DELIVERED = "delivered"
+LOST = "lost"
+REFUSED = "refused"
+RETRYABLE_STATUS_CODES = (408, 425, 429)
+
+class ExportWatch:
+    """What this process saw of its span exports: the batches that Langfuse refused or never answered.
+
+    The SDK's flush returns nothing and swallows errors, so a lost batch
+    cannot be seen there. The OTLP exporter sends with requests, and every
+    send of a batch passes requests.Session.send. A batch that failed and was
+    sent again counts by its last try."""
+
+    def __init__(self) -> None:
+        self.last_try: Dict[Any, str] = {}
+
+    def record(self, body: Any, status_code: Optional[int]) -> None:
+        """status_code is None when the batch got no answer."""
+        key = hashlib.sha256(body).digest() if isinstance(body, (bytes, bytearray)) else len(self.last_try)
+        if status_code is not None and status_code < 400:
+            self.last_try[key] = DELIVERED
+        elif status_code is None or status_code >= 500 or status_code in RETRYABLE_STATUS_CODES:
+            self.last_try[key] = LOST
+        else:
+            self.last_try[key] = REFUSED
+
+    def verdict(self) -> str:
+        outcomes = set(self.last_try.values())
+        return LOST if LOST in outcomes else REFUSED if REFUSED in outcomes else DELIVERED
+
+EXPORT_WATCH = ExportWatch()
+
+def install_export_watch(watch: ExportWatch = EXPORT_WATCH) -> bool:
+    """Record the outcome of every span batch this process sends. False when requests is not there."""
+    try:
+        import requests
+    except ImportError:
+        return False
+    original = requests.Session.send
+    if getattr(original, "_langfuse_export_watch", None) is watch:
+        return True
+
+    def watched_send(session: Any, request: Any, **kwargs: Any) -> Any:
+        url = getattr(request, "url", "")
+        is_span_batch = isinstance(url, str) and url.split("?")[0].rstrip("/").endswith("/v1/traces")
+        try:
+            response = original(session, request, **kwargs)
+        except Exception:
+            if is_span_batch:
+                watch.record(getattr(request, "body", None), None)
+            raise
+        if is_span_batch:
+            status = getattr(response, "status_code", None)
+            watch.record(getattr(request, "body", None), status if isinstance(status, int) else None)
+        return response
+
+    watched_send._langfuse_export_watch = watch  # type: ignore[attr-defined]
+    requests.Session.send = watched_send  # type: ignore[method-assign]
+    return True
+
+def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> str:
+    """Flush and shut down the client, waiting at most FLUSH_TIMEOUT_SECONDS.
+
+    Returns DELIVERED, or LOST when the flush did not finish in time or a batch
+    failed on its last try, or REFUSED when Langfuse refused a batch."""
+    if langfuse is None:
+        return DELIVERED
+
     try:
         def _flush_and_shutdown():
             try:
@@ -5192,9 +5427,17 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
 
         t = threading.Thread(target=_flush_and_shutdown, daemon=True)
         t.start()
-        t.join(5.0)
+        t.join(FLUSH_TIMEOUT_SECONDS)
+        finished = not t.is_alive()
     except Exception:
-        pass
+        return LOST
+    verdict = EXPORT_WATCH.verdict()
+    if not finished:
+        info(f"flush to Langfuse did not finish within {FLUSH_TIMEOUT_SECONDS:g} s")
+        return LOST
+    if verdict != DELIVERED:
+        info(f"Langfuse did not take a batch of spans ({verdict})")
+    return verdict
 
 
 # ----------------- Main -----------------
@@ -5223,10 +5466,12 @@ def main() -> int:
         sweep_stale_context_files()
         sweep_saved_api_requests()
 
+    install_export_watch()
     langfuse = create_langfuse_client(config)
     if langfuse is None:
         return 0
 
+    firing = FiringRecord()
     try:
         emitted = emit_new_turns_from_transcript(
             langfuse,
@@ -5235,6 +5480,7 @@ def main() -> int:
             transcript_path,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
             payload_agent_type=get_main_agent_type_from_payload(payload),
+            firing=firing,
         )
 
         dur = time.time() - start
@@ -5250,7 +5496,13 @@ def main() -> int:
         return 0
 
     finally:
-        flush_and_shutdown_langfuse_client(langfuse)
+        delivery = flush_and_shutdown_langfuse_client(langfuse)
+        try:
+            settle_root_claims(delivery == DELIVERED)
+            if delivery == LOST:
+                undo_unconfirmed_firing(firing)
+        except Exception as e:
+            debug(f"settling the firing failed: {type(e).__name__}: {e}")
 
 if __name__ == "__main__":
     sys.exit(main())

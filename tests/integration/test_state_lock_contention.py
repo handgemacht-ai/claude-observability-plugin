@@ -199,7 +199,7 @@ def test_main_logs_a_lock_timeout_without_debug(
         "public", "secret", "https://example.test", None
     ))
     monkeypatch.setattr(hook_module, "create_langfuse_client", lambda _config: object())
-    monkeypatch.setattr(hook_module, "flush_and_shutdown_langfuse_client", lambda _client: None)
+    monkeypatch.setattr(hook_module, "flush_and_shutdown_langfuse_client", lambda _client: hook_module.DELIVERED)
 
     def refuse(*_args: Any, **_kwargs: Any) -> int:
         raise TimeoutError("could not acquire lock within 2.0s")
