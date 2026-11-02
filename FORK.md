@@ -7,9 +7,25 @@ Everything else works as described in the [README](./README.md).
 
 - **Agents at any depth**: each subagent, Workflow-spawned agent and resumed
   agent run nests under the tool call that started it, including agents that
-  subagents start themselves. An agent that a forked skill starts, whose
-  transcript opens with the skill text as an injected (`isMeta`) user row, runs
-  under that text as its prompt.
+  subagents and Workflow agents start themselves. An agent that a forked skill
+  starts, whose transcript opens with the skill text as an injected (`isMeta`)
+  user row, runs under that text as its prompt.
+  - Claude Code 2.1.31x writes every agent flat in `subagents/` (the agents of
+    a Workflow run in `subagents/workflows/<run>/`). The `meta.json` of an agent
+    carries the `toolUseId` of its launching call, except for the agents of a
+    Workflow run and the agents that a forked skill starts: they carry
+    `parentAgentId` and `spawnDepth` only.
+  - The launching call of such an agent is found in the transcript of the agent
+    that started it (`parentAgentId`, else the main transcript): the `Agent`,
+    `Task` or `Skill` call whose result names the agent id
+    (`toolUseResult.agentId`), else the `Skill` call that was running when the
+    agent started (a skill forked in the foreground leaves no agent id; the
+    agent starts within a few milliseconds of its call). A call serves one
+    agent; two agents that started together take the calls in call order.
+    The agent's metadata says `attributed_by` (`launch_result` or
+    `skill_call_time`) when the link came from there.
+  - An agent that no call started (a forked skill that the user typed as a slash
+    command) has no tool call to nest under and is not sent.
 - **Agent names**: the main agent (`--agent` or the `agent` setting) and each
   subagent type show up in observation names, the trace name, tags and metadata.
 - **One trace per request**: a message continues the current trace when the
@@ -33,6 +49,32 @@ Everything else works as described in the [README](./README.md).
   a claim file in `~/.claude/state/langfuse_root_claims`; any other process that
   reads the same transcript (for example through a different state directory)
   skips the root.
+  - A claim is `pending` while the root goes out and `sent` once the hook has
+    seen its spans delivered (see "Delivery"). A pending claim of a process that
+    is gone, or older than 15 minutes, is taken over; the process that took
+    a claim gives it back when delivery failed. A claim file with no content is
+    one of release `1.3.0-handgemacht.9` or earlier and counts as `sent`.
+- **State follows the session**: the export state (`langfuse_state.json`) is kept
+  under a key made from the session id, not from the path of the log. A session
+  that enters or leaves a worktree moves its log (and its `<session>/` folder) to
+  another project folder; the hook goes on at the byte where it stopped, when the
+  log at the new path starts with the same bytes (the state holds a hash of the
+  first 4 KiB) and holds at least what was read. A log that has the same session
+  id but another start is another log and keeps a state of its own (Claude Code
+  gives some runs a session id worked out from a name). State saved by release
+  `1.3.0-handgemacht.9` and earlier, under a key made from session and path, is
+  taken over when the session is next seen at that path.
+- **Delivery**: the SDK's flush returns nothing and swallows errors, so the hook
+  watches `requests.Session.send`, which the OTLP exporter uses for every span
+  batch. After the flush, the spans are `delivered`; `lost` when a batch got no
+  answer or a 5xx, 408, 425 or 429 on its last try, or the flush did not finish in
+  5 seconds; `refused` for any other error status (a wrong key, a batch that is
+  too big). A refused or lost firing gives its root claims back. A lost firing
+  also puts its session state back as it was, so the next firing reads the same
+  rows and sends the same turns again, up to three times in a row; refused
+  batches are not sent again, because the answer would be the same. A span has
+  the same id each time it is sent, so one that arrived after all appears twice
+  under one id.
 - **Predictable span ids**: a program that knows a trace can compute the span
   id of the root, of every LLM call and of every tool step (edits included)
   without asking Langfuse, for example to nest its own runs under a step.
@@ -199,7 +241,8 @@ indexes that are older than seven days.
   records its progress only after it has handed every new turn to the SDK, so a
   hook stopped earlier would send the same turns again on the next `Stop`.
   A hook stopped after that point, while the SDK is still delivering, can lose
-  spans but never duplicates them.
+  spans; one that ran to the end puts its progress back when it saw the delivery
+  fail (see "Delivery").
 - Each turn is sent by its own `Stop` hook. The `SessionEnd` hook only sends
   turns that were still waiting for background agents. Claude Code gives all
   `SessionEnd` hooks 1.5 seconds in total, and a plugin's own `timeout` does
