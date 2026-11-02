@@ -75,6 +75,17 @@ Everything else works as described in the [README](./README.md).
   batches are not sent again, because the answer would be the same. A span has
   the same id each time it is sent, so one that arrived after all appears twice
   under one id.
+  - A firing saves its progress before the flush, and Claude Code stops a
+    `SessionEnd` hook after 1.5 seconds in total, so a firing can be stopped
+    before it knows whether its spans arrived (a flush to a Langfuse that is down
+    takes longer). Before it saves, the firing leaves a note in the state folder,
+    `langfuse_firing.<session>.<pid>.json`, with the state as it was, and removes
+    it when it knows the outcome. The next firing of the session puts the state
+    back from every note whose process is gone or that is older than 15 minutes,
+    the newest note first so that the oldest state comes back last, and counts it
+    in the same three tries in a row. A session that is not resumed has no next
+    firing, so what its stopped firing sent stays unsent. Notes older than 30
+    days are removed at session end.
 - **Predictable span ids**: a program that knows a trace can compute the span
   id of the root, of every LLM call and of every tool step (edits included)
   without asking Langfuse, for example to nest its own runs under a step.
@@ -240,14 +251,17 @@ indexes that are older than seven days.
   command hooks. Catching up on many turns can take close to a minute. The hook
   records its progress only after it has handed every new turn to the SDK, so a
   hook stopped earlier would send the same turns again on the next `Stop`.
-  A hook stopped after that point, while the SDK is still delivering, can lose
-  spans; one that ran to the end puts its progress back when it saw the delivery
-  fail (see "Delivery").
+  A hook that ran to the end puts its progress back when it saw the delivery
+  fail; one stopped after that point, while the SDK is still delivering, leaves
+  a note that the next firing of the session uses to put it back (see
+  "Delivery").
 - Each turn is sent by its own `Stop` hook. The `SessionEnd` hook only sends
   turns that were still waiting for background agents. Claude Code gives all
   `SessionEnd` hooks 1.5 seconds in total, and a plugin's own `timeout` does
   not extend that budget. To give it more time, set
   `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` (for example `30000`); the plugin
-  caps its `SessionEnd` hook at 60 seconds.
+  caps its `SessionEnd` hook at 60 seconds. A `SessionEnd` hook that is stopped
+  while it flushes is sent again by the next firing of the session (see
+  "Delivery").
 - The `InstructionsLoaded` and `SessionStart` hooks run in the background, so
   they never hold up Claude.

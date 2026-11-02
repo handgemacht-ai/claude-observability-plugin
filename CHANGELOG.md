@@ -16,8 +16,9 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
 
 [PR #11](https://github.com/handgemacht-ai/claude-observability-plugin/pull/11), on top of PR #10. Commits in landing order:
 `8058c18` (helpers of helpers), `eb3e042` (state that follows the session), `83f02ec` (root claims and delivery), `fea646f`
-(`FORK.md`), `92b0b48` (version), and the commit that adds this entry. Each of the first three has its own tests and works on its own.
-"Before" in this entry is release `1.3.0-handgemacht.9`.
+(`FORK.md`), `92b0b48` (version), `6b6ea41` (the first version of this entry), `10967af` (an undone firing that moved state keeps the old
+entry), `74a9a19` (firings stopped before they knew the outcome), `b6749fd` (no signal to a process on Windows), and the commit that brings `FORK.md` and this entry up to date. Each of the
+code commits has its own tests and works on its own. "Before" in this entry is release `1.3.0-handgemacht.9`.
 
 **What changed**
 - **Helpers of helpers** (`get_subagent_transcripts_by_tool_use_id`). Claude Code 2.1.31x writes every agent flat in `subagents/`
@@ -44,7 +45,23 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
   error status (a wrong key, a batch that is too big). A refused or lost firing gives its root claims back; a lost firing also puts the session state back as
   it was before the firing, so the next firing reads the same rows and sends the same turns again. After three lost firings in a row the hook goes on.
   Refused batches are not sent again, the answer would be the same.
-- `FORK.md` describes the three. Version raised to `1.3.0-handgemacht.10` in `.claude-plugin/plugin.json`.
+- **A lost firing that moved the state keeps the old entry** (`undo_unconfirmed_firing`). In the first firing after the update, the state of a
+  running session moves from the old key to the key of the session. When that firing was lost, the undo put the old entry back and also wrote an empty
+  entry under the key of the session; the next firing took the empty one, read the log from byte 0 and sent every turn of the session again (a session
+  with 2 sent turns and a lost firing for a third sent questions 1, 2 and 3 again; roots are held by their claims, but every LLM call and tool step went
+  out twice under the same ids). The empty entry is now written only when the session had no entry under any key; otherwise the old entry comes back and
+  the next firing moves it again.
+- **A firing that is stopped before it knows the outcome is sent again.** A firing saves its progress before the flush, and Claude Code stops a
+  `SessionEnd` hook after 1.5 seconds in total. A flush to a Langfuse that is down takes longer (3.4 to 3.8 seconds in the tests below), so the
+  `SessionEnd` firing was stopped after its state said the turns were sent and before it could see that they were not: no verdict, no undo, and a session
+  that was resumed afterwards never sent its first request. The firing now leaves a note, `langfuse_firing.<session>.<pid>.json` in the state folder,
+  with the state as it was, before it saves its progress, and removes it when it knows the outcome. The next firing of the session puts the state back from
+  every note whose process is gone, or that is older than 15 minutes (`FIRING_NOTE_MAX_AGE`), the newest note first so that the oldest state comes back
+  last, and counts it in the same three tries in a row. The claims of the stopped firing are `pending` and its process is gone, so they are taken over
+  and the roots are sent again. The sweep at session end removes notes older than 30 days.
+- **No signal to a process on Windows** (`_process_is_gone`). The check whether the process of a claim or a note is gone uses `os.kill(pid, 0)`, which on Windows ends the
+  process whatever the signal. It is not called there any more; the age of the claim or note (15 minutes) decides.
+- `FORK.md` describes them. Version raised to `1.3.0-handgemacht.10` in `.claude-plugin/plugin.json`.
 
 **Why**
 - Helpers: in the local logs of the last 30 days (975 sessions with agents, both profiles) 17 helpers had `parentAgentId` and no `toolUseId`: 12 forked skill
@@ -52,6 +69,11 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
   them at every firing. They, their LLM calls and their tool steps never reached Langfuse, so no program could nest under those steps.
 - Moved logs: 24 of 124 recent transcripts were relocated at least once, and one session sent 373 tool steps twice (hook log line "Processed 24 turns in
   25.47s" at the second move). The root claim stopped most second roots (234 log lines in 8 days) but the steps went out again.
+- Outage, from the proof run on a throw-away Langfuse 4.43.0 with real Claude Code 2.1.314 sessions (the live Langfuse was not touched): the web container was stopped for
+  10 min 42 s and again for 3 minutes. The `Stop` firings logged "spans of session … did not arrive; the next firing sends them again (try 2 of 4)", the `SessionEnd` firing
+  logged nothing after "Processed 1 turns" (Claude Code exited about 2 seconds after it started, before the flush could give a verdict), and 4 of 4 sessions that were resumed afterwards sent only the new request: Langfuse held 1 root and
+  1 tool step per resumed session, the tool calls of the first request were missing. The other sessions lost their steps the same way. A program that
+  nests its records under those steps (the readability gate) could only file them alone.
 - Roots: trace `99c7191b` had its claim written on 1 November and no root in Langfuse; its 98 steps arrived as orphans at the next full re-send, where the claim
   blocked the root. The claim never expired, never knew whether the root had arrived, and nothing sent a lost firing again. The claim directory holds 944 files.
 
@@ -71,13 +93,23 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
   claims `sent`. With 401 in firing 1: 1 of 2 before and after (a refusal is not sent again), and no claim left for the root that was refused. Accepted both times: 2 of 2 before
   and after, nothing twice. The watch also read a 413, a 5xx, a closed port and a server slower than 5 s correctly. Log lines: "Langfuse did not take a batch of
   spans (lost)", "spans of session … did not arrive; the next firing sends them again (try 2 of 4)", "root claim of trace … is stale; taking it over".
-- `uv run --group dev pytest`: 466 tests (Python 3.10 and 3.14), 67 of them new (`tests/unit/test_agent_launch_attribution.py`,
+- Stopped firing, with the real hook script against a local stand-in for Langfuse (SDK 4.18, OpenTelemetry 1.45): a Langfuse that is down (closed port), a `Stop` firing, a
+  `SessionEnd` firing stopped with `kill -9` after 1.5 seconds, then the session resumed against a working Langfuse with a second question. Before: the first `Stop` firing
+  ends after 3.8 s and puts its state back, the stopped `SessionEnd` firing leaves the state at the end of the log, and the working Langfuse received only "Question 2?".
+  After: it received "Question 1?" and "Question 2?", the hook log says "a firing of session … was stopped before it knew whether its spans arrived" and "root claim of
+  trace … is stale; taking it over", and no note is left in the state folder.
+- Lost firing during the move to the new key, in a test (legacy-key state of a session with 2 sent turns, a new turn with a lost flush, then a delivered firing): before, the
+  delivered firing sent questions 1, 2 and 3 again; after, only question 3 (it was lost once, so it is sent twice in all).
+- The offline runs above were repeated with these two commits: the four real logs give the same numbers as before them (4,821, 1,134, 4,612 and 4,714 observations, no tool step
+  twice, one state entry), and the earlier delivery run gives the same results.
+- `uv run --group dev pytest`: 479 tests (Python 3.10 and 3.14), 80 of them new (`tests/unit/test_agent_launch_attribution.py`,
   `tests/integration/test_helpers_of_agents.py`, `tests/integration/test_session_state_key.py`, `tests/unit/test_root_claims.py`,
   `tests/integration/test_root_delivery.py`, shared builders in `tests/session_files.py`), all with synthetic rows.
 
 **How to undo**
 - Revert the PR's commits and update the plugin. Release 9 keys its state by session and path again: a session that is running then reads its log once from the
-  start and sends its turns again, and claim files that release 10 wrote (they have content) count as claimed. Spans already sent stay.
+  start and sends its turns again, and claim files that release 10 wrote (they have content) count as claimed. Spans already sent stay. The `langfuse_firing.*` files in the
+  state folder can be deleted; release 9 does not read them.
 
 **Known limits**
 - Helpers, roots and steps already sent keep what they got; Langfuse cannot change them. The root of trace `99c7191b` and the other empty claim files of older releases
@@ -86,8 +118,11 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
   cannot be found from the new path); after that it follows the session.
 - The hook cannot see whether Langfuse accepted a batch and lost it later, or answered after the 5 seconds. A flush that is slow but delivered is counted as lost, and
   the same turns are sent up to three times more under the same ids; Langfuse shows one of them in the trace tree.
-- A hook that Claude Code stops before it has settled (the `SessionEnd` budget is 1.5 seconds) leaves its claims `pending`; they are taken over by the next process
-  or after 15 minutes, but nothing sends that firing again unless the session goes on.
+- A hook that Claude Code stops before it has settled (the `SessionEnd` budget is 1.5 seconds) leaves its claims `pending` and a note; the next firing of the session takes
+  the claims over and sends the firing again. A session that is not resumed has no next firing, so what its stopped firing sent stays unsent (after an outage, that is the case for
+  the sessions that end during it). A sweep that sends such sessions from other sessions' firings would make every `Stop` hook wait
+  for another session's backlog, and is not part of this change.
+- A firing that is stopped after its flush delivered the spans, and before it removed its note, is sent again by the next firing, and its spans appear twice under one id.
 - A firing whose emit failed inside the plugin (log line "emit_turn failed") is still counted as sent; only a failed delivery is sent again.
 - A forked skill that the user typed as a slash command has no launching call, so it is not sent. A skill forked in the background is emitted from the transcript as
   it is when its parent turn is sent, as before.
