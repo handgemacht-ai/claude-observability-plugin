@@ -79,7 +79,7 @@ Everything else works as described in the [README](./README.md).
     `SessionEnd` hook after 1.5 seconds in total, so a firing can be stopped
     before it knows whether its spans arrived (a flush to a Langfuse that is down
     takes longer). Before it saves, the firing leaves a note in the state folder,
-    `langfuse_firing.<session>.<pid>.json`, with the state as it was, and removes
+    `langfuse_firing.<session>.<pid>-<random>.json`, with the state as it was, and removes
     it when it knows the outcome. The next firing of the session puts the state
     back from every note whose process is gone or that is older than 15 minutes,
     the newest note first so that the oldest state comes back last, and counts it

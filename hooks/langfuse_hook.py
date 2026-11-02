@@ -5229,17 +5229,21 @@ def undo_unconfirmed_firing(firing: FiringRecord) -> None:
 # a firing can be stopped between the two and never learn whether its spans arrived.
 # It leaves a note of what the state was before it, to be undone by the next firing of
 # the session when the process that wrote it is gone.
-FIRING_NOTE_PATTERN = "langfuse_firing.{session}.{pid}.json"
+FIRING_NOTE_PATTERN = "langfuse_firing.{session}.{writer}.json"
 FIRING_NOTE_MAX_AGE = timedelta(minutes=15)
 
 def firing_note_glob(session_id: str) -> str:
-    return FIRING_NOTE_PATTERN.format(session=get_session_state_key(session_id)[:16], pid="*")
+    return FIRING_NOTE_PATTERN.format(session=get_session_state_key(session_id)[:16], writer="*")
+
+def new_firing_note_path(session_id: str) -> Path:
+    """The random part keeps a process that got the pid of a stopped one from writing over its note."""
+    return STATE_DIR / FIRING_NOTE_PATTERN.format(
+        session=get_session_state_key(session_id)[:16], writer=f"{os.getpid()}-{random.getrandbits(32):08x}")
 
 def leave_firing_note(firing: FiringRecord) -> None:
     """Leave the note before the progress is saved; fails open, a firing without one is as before."""
     try:
-        path = STATE_DIR / FIRING_NOTE_PATTERN.format(
-            session=get_session_state_key(firing.session_id)[:16], pid=os.getpid())
+        path = new_firing_note_path(firing.session_id)
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f"{path.name}.tmp")
         temporary.write_text(json.dumps({
