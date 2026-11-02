@@ -5202,11 +5202,13 @@ def undo_unconfirmed_firing(firing: FiringRecord) -> None:
                  f"going on without sending them again")
             return
         session_key = get_session_state_key(firing.session_id)
+        had_state = any(entry is not None for entry in firing.before.values())
         for key, entry in firing.before.items():
             if entry is not None:
                 state[key] = {**entry, "unconfirmed_firings": attempts + 1}
-            elif key == session_key:
+            elif key == session_key and not had_state:
                 # A session that had no state yet starts from the beginning, with the count of tries.
+                # One that had state under the old key gets it back there and is moved again by the next firing.
                 state[key] = {"unconfirmed_firings": attempts + 1, "updated": datetime.now(timezone.utc).isoformat()}
             else:
                 state.pop(key, None)
