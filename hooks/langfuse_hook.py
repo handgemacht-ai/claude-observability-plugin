@@ -2839,9 +2839,11 @@ def build_session_context(
 CONTEXT_FILE_MAX_AGE = timedelta(days=30)
 
 def sweep_stale_context_files(now: Optional[datetime] = None) -> None:
-    """Drop InstructionsLoaded/SessionStart record files of long-gone sessions."""
+    """Drop the record, claim and firing note files of long-gone sessions."""
     cutoff = ((now or datetime.now(timezone.utc)) - CONTEXT_FILE_MAX_AGE).timestamp()
-    for directory, pattern in ((STATE_DIR / CONTEXT_DIR_NAME, "*.jsonl"), (ROOT_CLAIM_DIR, "*.claim*")):
+    for directory, pattern in (
+        (STATE_DIR / CONTEXT_DIR_NAME, "*.jsonl"), (ROOT_CLAIM_DIR, "*.claim*"), (STATE_DIR, "langfuse_firing.*"),
+    ):
         try:
             for path in directory.glob(pattern):
                 try:
@@ -5176,6 +5178,8 @@ class FiringRecord:
     # State entries as they were before the firing, by key; None where there was none.
     before: Dict[str, Optional[Dict[str, Any]]] = field(default_factory=dict)
     saved: bool = False
+    # The note left on disk until the firing knows whether its spans arrived.
+    note_path: Optional[Path] = None
 
 # A firing whose spans did not arrive is sent again by the next one, up to this
 # many times in a row; then the hook goes on, so a server that stays unreachable
@@ -5217,6 +5221,72 @@ def undo_unconfirmed_firing(firing: FiringRecord) -> None:
          f"(try {attempts + 2} of {MAX_UNCONFIRMED_FIRINGS + 1})")
 
 
+# A firing saves its progress before the flush. Claude Code stops a SessionEnd hook
+# after 1.5 seconds in total, and a flush to a Langfuse that is down takes longer, so
+# a firing can be stopped between the two and never learn whether its spans arrived.
+# It leaves a note of what the state was before it, to be undone by the next firing of
+# the session when the process that wrote it is gone.
+FIRING_NOTE_PATTERN = "langfuse_firing.{session}.{pid}.json"
+FIRING_NOTE_MAX_AGE = timedelta(minutes=15)
+
+def firing_note_glob(session_id: str) -> str:
+    return FIRING_NOTE_PATTERN.format(session=get_session_state_key(session_id)[:16], pid="*")
+
+def leave_firing_note(firing: FiringRecord) -> None:
+    """Leave the note before the progress is saved; fails open, a firing without one is as before."""
+    try:
+        path = STATE_DIR / FIRING_NOTE_PATTERN.format(
+            session=get_session_state_key(firing.session_id)[:16], pid=os.getpid())
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp")
+        temporary.write_text(json.dumps({
+            "session_id": firing.session_id, "pid": os.getpid(), "host": socket.gethostname(),
+            "at": datetime.now(timezone.utc).isoformat(), "before": firing.before,
+        }), encoding="utf-8")
+        os.replace(temporary, path)
+        firing.note_path = path
+    except Exception as e:
+        debug(f"could not leave a note of the firing, it will not be undone if it is stopped: {e}")
+
+def clear_firing_note(firing: FiringRecord) -> None:
+    if firing.note_path is not None:
+        with contextlib.suppress(OSError):
+            firing.note_path.unlink()
+        firing.note_path = None
+
+def _firing_note_time(note: Dict[str, Any]) -> datetime:
+    written_at = parse_timestamp(note.get("at"))
+    return _as_aware(written_at) if written_at is not None else datetime.min.replace(tzinfo=timezone.utc)
+
+def _firing_was_stopped(note: Dict[str, Any]) -> bool:
+    """True when the process that wrote the note is gone, or has had longer than a hook can run."""
+    return (_process_is_gone(note.get("host"), note.get("pid"))
+            or datetime.now(timezone.utc) - _firing_note_time(note) > FIRING_NOTE_MAX_AGE)
+
+def undo_firings_stopped_before_confirmation(session_id: str) -> None:
+    """Put the state of the session back as it was before firings that were stopped before they knew whether
+    their spans arrived, so this firing sends the same turns again. The oldest state comes back last."""
+    try:
+        paths = list(STATE_DIR.glob(firing_note_glob(session_id)))
+    except OSError:
+        return
+    stopped: List[Tuple[Path, Dict[str, Any]]] = []
+    for path in paths:
+        try:
+            note = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(note, dict) and note.get("session_id") == session_id and isinstance(note.get("before"), dict) \
+                and _firing_was_stopped(note):
+            stopped.append((path, note))
+    for path, note in sorted(stopped, key=lambda item: _firing_note_time(item[1]), reverse=True):
+        info(f"a firing of session {session_id} (process {note.get('pid')}) was stopped before it knew whether "
+             f"its spans arrived")
+        undo_unconfirmed_firing(FiringRecord(session_id=session_id, before=note["before"], saved=True))
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
 def emit_new_turns_from_transcript(
     langfuse: Langfuse,
     config: LangfuseConfig,
@@ -5228,6 +5298,7 @@ def emit_new_turns_from_transcript(
     firing: Optional[FiringRecord] = None,
 ) -> int:
     with FileLock(get_session_lock_path(get_session_state_key(session_id))):
+        undo_firings_stopped_before_confirmation(session_id)
         with FileLock(LOCK_FILE):
             state = load_hook_state()
         if firing is not None:
@@ -5330,11 +5401,14 @@ def emit_new_turns_from_transcript(
             session_context=session_context,
         )
 
-        # Known limitation (accepted, like the crash-between-emit-and-save
-        # duplicate window): progress is persisted before the SDK flush in
-        # main(); a dropped flush leaves emitted_keys pointing at spans that
-        # never reached the server.
+        # Progress is persisted before the SDK flush in main(), so a dropped
+        # flush leaves emitted_keys pointing at spans that never reached the
+        # server. main() puts the state back when it sees the delivery fail;
+        # the note left here lets the next firing do the same when this
+        # process is stopped before it knows.
         record_transcript_identity(session_state, transcript_path)
+        if firing is not None:
+            leave_firing_note(firing)
         with FileLock(LOCK_FILE):
             state = load_hook_state()
             for superseded_key in superseded_keys:
@@ -5503,6 +5577,7 @@ def main() -> int:
             settle_root_claims(delivery == DELIVERED)
             if delivery == LOST:
                 undo_unconfirmed_firing(firing)
+            clear_firing_note(firing)
         except Exception as e:
             debug(f"settling the firing failed: {type(e).__name__}: {e}")
 

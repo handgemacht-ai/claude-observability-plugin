@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import threading
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests.session_files import assistant, user
+from tests.session_files import a_pid_that_is_gone, assistant, user
 
 SESSION = "session-delivery"
 
@@ -66,6 +68,32 @@ def state_entries(hook_module: Any) -> dict[str, Any]:
     return json.loads(hook_module.STATE_FILE.read_text()) if hook_module.STATE_FILE.exists() else {}
 
 
+def firing_notes(hook_module: Any) -> list[Path]:
+    return sorted(hook_module.STATE_DIR.glob("langfuse_firing.*"))
+
+
+def stopped_firing(hook_module: Any, fake_langfuse: Any, transcript: Path, *, process_is_gone: bool = True) -> None:
+    """A firing that saved its progress and was stopped before its flush finished, as Claude Code does
+    to a SessionEnd hook after 1.5 seconds: no verdict, no claim settled. With process_is_gone False the
+    process that did it is another one that is still running (the parent of the test)."""
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", None)
+    firing = hook_module.FiringRecord()
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, transcript, firing=firing)
+    hook_module.SENT_ROOT_CLAIMS.clear()
+    pid = a_pid_that_is_gone() if process_is_gone else os.getppid()
+    # Every firing of a real process has a note of its own; in this test they all share one pid.
+    note = firing.note_path.rename(firing.note_path.with_name(f"{firing.note_path.name}.{len(firing_notes(hook_module))}.json"))
+    claim_files = list(hook_module.ROOT_CLAIM_DIR.iterdir()) if hook_module.ROOT_CLAIM_DIR.exists() else []
+    for path in [note, *claim_files]:
+        content = json.loads(path.read_text(encoding="utf-8"))
+        path.write_text(json.dumps({**content, "pid": pid}), encoding="utf-8")
+
+
+def sent_since(fake_langfuse: Any, count: int) -> list[str]:
+    return [o.kwargs["input"]["content"] for o in fake_langfuse.observations[count:] if o.name == "Conversational Turn"]
+
+
+
 def test_a_root_that_arrived_stays_claimed_and_is_not_sent_again(hook, hook_module, fake_langfuse):
     append(hook.transcript, question(1))
 
@@ -106,6 +134,116 @@ def test_the_turns_of_a_firing_that_did_not_arrive_are_sent_with_the_next_ones(h
     assert asked.count("Question 2?") == 2, "the second question was lost once and sent again"
     assert asked.count("Question 3?") == 1
     assert asked.count("Question 1?") == 1
+
+
+def test_a_firing_that_was_stopped_before_it_knew_whether_its_spans_arrived_is_sent_again(
+    hook, hook_module, fake_langfuse
+):
+    append(hook.transcript, question(1))
+    stopped_firing(hook_module, fake_langfuse, hook.transcript)
+    sent = len(fake_langfuse.observations)
+
+    hook.stop(hook_module.DELIVERED)
+
+    assert sent_since(fake_langfuse, sent) == ["Question 1?"], "the stopped firing's turn was not sent again"
+    assert [claim["state"] for claim in claims(hook_module)] == ["sent"]
+    assert firing_notes(hook_module) == []
+    [entry] = state_entries(hook_module).values()
+    assert entry["offset"] == hook.transcript.stat().st_size
+
+
+def test_an_outage_that_stops_the_session_end_firing_does_not_lose_the_first_request(
+    hook, hook_module, fake_langfuse
+):
+    # The Stop firing is lost and put back; the SessionEnd firing sends the request again
+    # and is stopped by Claude Code before it knows whether it arrived; the session is resumed.
+    append(hook.transcript, question(1))
+    hook.stop(hook_module.LOST)
+    stopped_firing(hook_module, fake_langfuse, hook.transcript)
+    append(hook.transcript, question(2))
+    sent = len(fake_langfuse.observations)
+
+    hook.stop(hook_module.DELIVERED)
+
+    assert sent_since(fake_langfuse, sent) == ["Question 1?", "Question 2?"]
+
+
+def test_the_note_of_a_firing_that_is_still_running_is_left_alone(hook, hook_module, fake_langfuse):
+    append(hook.transcript, question(1))
+    stopped_firing(hook_module, fake_langfuse, hook.transcript, process_is_gone=False)
+    [note] = firing_notes(hook_module)
+    append(hook.transcript, question(2))
+    sent = len(fake_langfuse.observations)
+
+    hook.stop(hook_module.DELIVERED)
+
+    assert sent_since(fake_langfuse, sent) == ["Question 2?"]
+    assert firing_notes(hook_module) == [note], "the running firing still needs its note"
+
+
+def test_the_note_of_a_firing_that_has_had_longer_than_a_hook_can_run_counts_as_stopped(
+    hook, hook_module, fake_langfuse
+):
+    append(hook.transcript, question(1))
+    stopped_firing(hook_module, fake_langfuse, hook.transcript, process_is_gone=False)
+    [note] = firing_notes(hook_module)
+    content = json.loads(note.read_text(encoding="utf-8"))
+    long_ago = datetime.now(timezone.utc) - hook_module.FIRING_NOTE_MAX_AGE - timedelta(minutes=1)
+    note.write_text(json.dumps({**content, "at": long_ago.isoformat()}), encoding="utf-8")
+    sent = len(fake_langfuse.observations)
+
+    hook.stop(hook_module.DELIVERED)
+
+    assert sent_since(fake_langfuse, sent) == ["Question 1?"]
+    assert firing_notes(hook_module) == []
+
+
+def test_two_firings_that_were_stopped_put_back_the_oldest_state(hook, hook_module, fake_langfuse):
+    # The second firing started while the first was still running, so it went on from the first one's progress.
+    append(hook.transcript, question(1) + question(2))
+    stopped_firing(hook_module, fake_langfuse, hook.transcript, process_is_gone=False)
+    append(hook.transcript, question(3))
+    stopped_firing(hook_module, fake_langfuse, hook.transcript)
+    for note in firing_notes(hook_module):
+        content = json.loads(note.read_text(encoding="utf-8"))
+        note.write_text(json.dumps({**content, "pid": a_pid_that_is_gone()}), encoding="utf-8")
+    sent = len(fake_langfuse.observations)
+
+    hook.stop(hook_module.DELIVERED)
+
+    assert sent_since(fake_langfuse, sent) == ["Question 1?", "Question 2?", "Question 3?"]
+
+
+def test_firings_that_were_stopped_again_and_again_are_given_up_on(hook, hook_module, fake_langfuse):
+    append(hook.transcript, question(1))
+    for _ in range(hook_module.MAX_UNCONFIRMED_FIRINGS + 1):
+        stopped_firing(hook_module, fake_langfuse, hook.transcript)
+    sent = len(fake_langfuse.observations)
+
+    hook.stop(hook_module.DELIVERED)
+
+    assert sent_since(fake_langfuse, sent) == [], "the hook must go on after a few tries in a row"
+    assert firing_notes(hook_module) == []
+
+
+@pytest.mark.parametrize("delivery", ["delivered", "lost", "refused"])
+def test_a_firing_that_knows_what_became_of_its_spans_leaves_no_note(hook, hook_module, fake_langfuse, delivery):
+    append(hook.transcript, question(1))
+
+    hook.stop(delivery)
+
+    assert firing_notes(hook_module) == []
+
+
+def test_a_note_that_cannot_be_written_does_not_stop_the_firing(hook, hook_module, fake_langfuse, monkeypatch):
+    append(hook.transcript, question(1))
+    monkeypatch.setattr(hook_module, "FIRING_NOTE_PATTERN", "no-such-folder/{session}.{pid}")
+
+    hook.stop(hook_module.DELIVERED)
+
+    assert len(roots(fake_langfuse)) == 1
+    [entry] = state_entries(hook_module).values()
+    assert entry["offset"] == hook.transcript.stat().st_size
 
 
 def test_a_session_that_still_has_its_state_under_the_old_key_is_not_sent_again_after_a_lost_firing(

@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from tests.session_files import a_pid_that_is_gone
+
 TRACE = "a" * 32
 
 
@@ -21,18 +23,6 @@ def write_claim(hook_module: Any, **content: Any) -> None:
 
 def claimed_at(minutes_ago: float) -> str:
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
-
-
-def a_pid_that_is_gone() -> int:
-    pid = 4_000_000
-    while True:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return pid
-        except OSError:
-            pass
-        pid += 1
 
 
 def test_the_first_claim_wins_and_a_second_one_is_refused(hook_module, isolated_hook_state):
@@ -171,3 +161,17 @@ def test_the_sweep_removes_old_claims_and_what_a_crash_left_beside_them(hook_mod
     hook_module.sweep_stale_context_files()
 
     assert [p.name for p in hook_module.ROOT_CLAIM_DIR.iterdir()] == [fresh.name]
+
+
+def test_the_sweep_removes_old_notes_of_stopped_firings(hook_module, isolated_hook_state):
+    isolated_hook_state.mkdir(parents=True)
+    old = isolated_hook_state / "langfuse_firing.0123456789abcdef.99.json"
+    fresh = isolated_hook_state / "langfuse_firing.0123456789abcdef.100.json"
+    for path in (old, fresh):
+        path.write_text("{}")
+    stamp = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
+    os.utime(old, (stamp, stamp))
+
+    hook_module.sweep_stale_context_files()
+
+    assert fresh.exists() and not old.exists()
