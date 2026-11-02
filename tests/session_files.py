@@ -14,13 +14,13 @@ def stamp(seconds: float) -> str:
     return (BASE + timedelta(seconds=seconds)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def user(uuid: str, at: float, text: str = "Go.", **extra: Any) -> dict[str, Any]:
-    return {"type": "user", "timestamp": stamp(at), "sessionId": SESSION, "uuid": uuid,
+def user(uuid: str, at: float, text: str = "Go.", session: str = SESSION, **extra: Any) -> dict[str, Any]:
+    return {"type": "user", "timestamp": stamp(at), "sessionId": session, "uuid": uuid,
             "message": {"role": "user", "content": text}, **extra}
 
 
-def assistant(uuid: str, at: float, blocks: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"type": "assistant", "timestamp": stamp(at), "sessionId": SESSION, "uuid": uuid,
+def assistant(uuid: str, at: float, blocks: list[dict[str, Any]], session: str = SESSION) -> dict[str, Any]:
+    return {"type": "assistant", "timestamp": stamp(at), "sessionId": session, "uuid": uuid,
             "message": {"id": f"msg-{uuid}", "role": "assistant", "model": "claude-test", "content": blocks}}
 
 
