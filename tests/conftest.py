@@ -276,6 +276,8 @@ def _isolated_hook_env(tmp_path: Path, hook_module: Any, monkeypatch: pytest.Mon
     # developer's real ~/.claude out of the tests.
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     hook_module._AGENT_DEFINITION_CACHE.clear()
+    hook_module.SENT_ROOT_CLAIMS.clear()
+    hook_module.EXPORT_WATCH.last_try.clear()
     _reset_hook_logger(hook_module)
     yield state_dir
     _reset_hook_logger(hook_module)
