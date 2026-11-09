@@ -49,7 +49,9 @@ Everything else works as described in the [README](./README.md).
   row without a reason keeps the turn waiting until the turn ends. A hand-back or
   an attached notification after the last answer of the turn holds it until the
   agent has answered; a notification that arrives again after its helper handed
-  back and the hand-back was answered gets no answer and holds nothing. The
+  back and the hand-back was answered holds nothing. Most such repeats get no
+  answer; one in about seven does, and that reply goes out as an LLM call of the
+  turn while the turn's root keeps the earlier answer and end time. The
   result of a helper's own background task, which the main log only queues and
   removes, does not hold the main turn.
   - A helper that the main agent launched and that its own background task
