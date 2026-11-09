@@ -15,6 +15,16 @@ Everything else works as described in the [README](./README.md).
     carries the `toolUseId` of its launching call, except for the agents of a
     Workflow run and the agents that a forked skill starts: they carry
     `parentAgentId` and `spawnDepth` only.
+  - A session that enters a worktree keeps its log in the project folder it
+    started in, but Claude Code can write the files of its agents under the
+    project folder of the worktree:
+    `<projects root>/<worktree folder>/<session>/subagents/`. The hook scans the
+    projects root once per firing for every `<session>/subagents/` folder of the
+    session, the one next to the log first, and takes agents from all of them
+    (launch links, helpers of helpers, the agents of a Workflow run). An agent
+    with files in two folders is read from the first folder that holds both its
+    `meta.json` and its log. The hook log says "has agent files in other project
+    folders" with their names. A `<session>.superseded-<ms>` folder is not read.
   - The launching call of such an agent is found in the transcript of the agent
     that started it (`parentAgentId`, else the main transcript): the `Agent`,
     `Task` or `Skill` call whose result names the agent id
@@ -26,6 +36,29 @@ Everything else works as described in the [README](./README.md).
     `skill_call_time`) when the link came from there.
   - An agent that no call started (a forked skill that the user typed as a slash
     command) has no tool call to nest under and is not sent.
+- **A turn waits for its helpers**: a turn that started a helper in the
+  background is not sent while the helper's result is still on its way to the
+  main agent, since the answer to it belongs to the turn. A result is on its way
+  once Claude Code has queued the helper's task notification, and has arrived
+  when the log shows it in one of the forms that Claude Code 2.1.31x writes: a
+  user row, an attachment to the running turn, a queue `remove` row that names
+  its reason (`absorbed_mid_turn` or `delivered_to_agent`), or the helper's
+  hand-back, a peer message that starts with `[Subagent hand-back]`. A `remove`
+  row without a reason keeps the turn waiting until the turn ends. A hand-back or
+  an attached notification after the last answer of the turn holds it until the
+  agent has answered; a notification that arrives again after its helper handed
+  back and the hand-back was answered gets no answer and holds nothing. The
+  result of a helper's own background task, which the main log only queues and
+  removes, does not hold the main turn.
+  - A helper that its own background task wakes after it stopped writes the
+    rows after the wake as a later run, `Subagent: … (resumed #n)` like a run
+    that `SendMessage` resumes. The run before it ends at the wake and is not
+    sent again. The main turn that holds the queued notification of the helper's
+    next stop sends the later run, once, under its own span: the span of the
+    launching call was sent and closed with the first run. A stop at the
+    `SubagentHandback` call counts as a stop. Only the rows that follow a wake
+    in the helper's own log are cut this way; helpers of helpers that their own
+    tasks wake have no such rows in their parent's log and stay as before.
 - **Agent names**: the main agent (`--agent` or the `agent` setting) and each
   subagent type show up in observation names, the trace name, tags and metadata.
 - **One trace per request**: a message continues the current trace when the
@@ -67,7 +100,9 @@ Everything else works as described in the [README](./README.md).
 - **Delivery**: the SDK's flush returns nothing and swallows errors, so the hook
   watches `requests.Session.send`, which the OTLP exporter uses for every span
   batch. After the flush, the spans are `delivered`; `lost` when a batch got no
-  answer or a 5xx, 408, 425 or 429 on its last try, or the flush did not finish in
+  answer or a 5xx, 408, 425 or 429 on its last try, when Langfuse answered with a
+  success but rejected spans of the batch (`partial_success.rejected_spans` in the
+  OTLP answer, read from protobuf or JSON), or the flush did not finish in
   5 seconds; `refused` for any other error status (a wrong key, a batch that is
   too big). A refused or lost firing gives its root claims back. A lost firing
   also puts its session state back as it was, so the next firing reads the same
@@ -75,7 +110,7 @@ Everything else works as described in the [README](./README.md).
   batches are not sent again, because the answer would be the same. A span has
   the same id each time it is sent, so one that arrived after all appears twice
   under one id.
-  - A firing saves its progress before the flush, and Claude Code stops a
+  - A firing saves its progress before its last flush, and Claude Code stops a
     `SessionEnd` hook after 1.5 seconds in total, so a firing can be stopped
     before it knows whether its spans arrived (a flush to a Langfuse that is down
     takes longer). Before it saves, the firing leaves a note in the state folder,
@@ -86,6 +121,22 @@ Everything else works as described in the [README](./README.md).
     in the same three tries in a row. A session that is not resumed has no next
     firing, so what its stopped firing sent stays unsent. Notes older than 30
     days are removed at session end.
+  - The client sends a request for every 25 spans (`EXPORT_BATCH_SPANS`; the
+    SDK waits for 512 and sends the rest at the end, so a held turn of 427 spans
+    of about 100 KB each went out as one request of 44 MB), unless the operator set
+    `LANGFUSE_FLUSH_AT`. In a `Stop` firing, the spans of each helper that the
+    main agent launched are flushed when the hook has handed them to the SDK
+    (nested helpers go out with their parent), so a big turn goes out helper by
+    helper. A flush that does not finish within 5 seconds ends this for the
+    firing; the flush at the end tells what did not arrive. A `SessionEnd`
+    firing does not flush between helpers, since it has 1.5 seconds in total.
+  - The warnings and errors of the `opentelemetry` and `langfuse` loggers go to
+    the hook log (`langfuse_hook.log` in the state folder), for example "Dropping
+    span batch" for a batch above the exporter's request size limit, and a line
+    "Langfuse answered a batch of spans with a partial success" with the number
+    of rejected spans and the message. A batch that the exporter drops before it
+    sends makes no request, so the watch counts it as `delivered`; only the
+    warning shows it.
 - **Predictable span ids**: a program that knows a trace can compute the span
   id of the root, of every LLM call and of every tool step (edits included)
   without asking Langfuse, for example to nest its own runs under a step.
@@ -150,7 +201,8 @@ optional settings.
 
 - Every agent observation nests under the `Tool: Agent` (or `Task`) call that
   launched it, at any depth. A `SendMessage` call that resumes a stopped agent
-  gets that run as `Subagent: … (resumed #n)`.
+  gets that run as `Subagent: … (resumed #n)`, and so does a run that the
+  agent's own background task wakes (see "A turn waits for its helpers").
 - Agents that a Workflow run starts nest under its `Tool: Workflow` call as
   `Workflow agent: <workflow>/<agent id>`, whatever agent type the workflow
   gave them. Agents they start in turn nest under them like any other launch.
@@ -238,6 +290,12 @@ indexes that are older than seven days.
   built-in agents are only marked `builtin`.
 - Agents defined only with `--agents` JSON or loaded with `--plugin-dir`: their
   definition file cannot be found, so they show `source: unknown`.
+- One of the two parts of an agent that has files in two project folders. A
+  session that left its worktree can split one agent's run in time: the early
+  part, with the full `meta.json`, under the folder of the worktree and the
+  later part, with a shorter `meta.json` or none, under the folder of the main
+  log. The parts share no rows, and only the files of the first folder that
+  holds both the `meta.json` and the log are read.
 - The full tool definitions: only the tool names are recorded.
 - Per-request system reminders and other context Claude Code adds on the fly,
   unless Claude Code saves its API requests (see LLM Call Inputs) or
