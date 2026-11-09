@@ -30,7 +30,7 @@ more of those steps.
   folder it started in, but Claude Code can write the files of its helpers under the project folder of the worktree,
   `<projects root>/<worktree folder>/<session>/subagents/`. The plugin only looked next to the log, so those helpers and their tool steps were never
   sent. Each firing now scans the projects root once and finds every `<session>/subagents/` folder of the session, the one next to the log first.
-  The list serves the launch attribution, the parent lookup of helpers of helpers, the task id map and the Workflow run lookup. A helper with files in two
+  The list serves the launch attribution, the parent lookup of helpers of helpers, the task id map and the Workflow run lookup, whose agents take their result from the run's journal in any of the folders. A helper with files in two
   folders is read from the first folder that holds both its meta and its log, so every helper sent before keeps the log it was read from. One info line names the other
   folders ("has agent files in other project folders"). A `<session>.superseded-<ms>` folder is not read. The tests now give each test, and each transcript fixture, a
   projects root of its own (`tests/conftest.py`), since they share session names.

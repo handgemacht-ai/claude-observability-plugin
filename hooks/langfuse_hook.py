@@ -2383,7 +2383,8 @@ class WorkflowAgentTranscriptsByRunId:
 
     The first lookup of a run id reads the directories of that run, one per
     subagents/ directory of the session; an agent found in more than one comes
-    from the first. The lookup then keeps
+    from the first. The run's journal can sit in another directory than the
+    agent, so a result comes from the journal of any of them. The lookup then keeps
     the result for its own life, which is one hook firing. Thus only a firing
     that emits a reference to a run reads that run, and it always reads the
     current files."""
@@ -2406,11 +2407,18 @@ class WorkflowAgentTranscriptsByRunId:
             if self._subagent_dirs is None:
                 self._subagent_dirs = get_session_subagent_dirs(self._transcript_path)
             agents_by_id: Dict[str, Dict[str, Any]] = {}
+            journal_results: Dict[str, Any] = {}
             try:
                 for subagent_dir in self._subagent_dirs:
-                    for agent in get_workflow_agents_in_run_dir(subagent_dir / "workflows" / run_id):
+                    run_dir = subagent_dir / "workflows" / run_id
+                    for agent in get_workflow_agents_in_run_dir(run_dir):
                         agents_by_id.setdefault(agent["agent_id"], agent)
+                    for agent_id, result in get_workflow_journal_results(run_dir).items():
+                        journal_results.setdefault(agent_id, result)
                 agents = list(agents_by_id.values())
+                for agent in agents:
+                    if agent["result"] is None:
+                        agent["result"] = journal_results.get(agent["agent_id"])
             except OSError as e:
                 # The file system can refuse a run path, for example when the
                 # name is too long. Such a failure must not stop the turn.

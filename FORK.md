@@ -21,7 +21,8 @@ Everything else works as described in the [README](./README.md).
     `<projects root>/<worktree folder>/<session>/subagents/`. The hook scans the
     projects root once per firing for every `<session>/subagents/` folder of the
     session, the one next to the log first, and takes agents from all of them
-    (launch links, helpers of helpers, the agents of a Workflow run). An agent
+    (launch links, helpers of helpers, the agents of a Workflow run and the
+    results in its journal). An agent
     with files in two folders is read from the first folder that holds both its
     `meta.json` and its log. The hook log says "has agent files in other project
     folders" with their names. A `<session>.superseded-<ms>` folder is not read.
