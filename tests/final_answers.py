@@ -15,6 +15,10 @@ import pytest
 from tests.session_files import SESSION, assistant, tool_result, tool_use, user
 
 ANSWER = "The tests pass."
+NEXT_QUESTION = "Commit it."
+NEXT_ANSWER = "Committed."
+# How long the flush of the waiting process takes before it counts as lost.
+SLOW_FLUSH_SECONDS = 0.5
 
 
 def append(transcript: Path, rows: list[dict[str, Any]]) -> None:
@@ -42,6 +46,15 @@ def claude_code_writes_the_final_answer_after(transcript: Path, seconds: float) 
     return writer
 
 
+def a_short_next_turn(transcript: Path) -> None:
+    append(transcript, [
+        user("u3", 10, NEXT_QUESTION),
+        assistant("a3", 11, [tool_use("toolu_2", "Bash", command="git commit")]),
+        tool_result("r3", 12, "toolu_2", "1 file changed"),
+        assistant("a4", 13, [{"type": "text", "text": NEXT_ANSWER}]),
+    ])
+
+
 class _Pipe(io.BytesIO):
     def close(self) -> None:
         self.sent = self.getvalue()
@@ -56,6 +69,8 @@ class Hook:
         self.transcript = transcript
         self.monkeypatch = monkeypatch
         self.started: list[tuple[list[str], _Pipe]] = []
+        self.in_background: list[threading.Thread] = []
+        self.failures: list[BaseException] = []
         monkeypatch.setattr(hook_module, "get_langfuse_config", lambda: hook_module.LangfuseConfig(
             "public", "secret", "https://example.test", None))
         monkeypatch.setattr(hook_module, "create_langfuse_client", lambda _config: fake_langfuse)
@@ -90,6 +105,25 @@ class Hook:
         for args, pipe in started:
             self._run(args[2:], pipe.sent.decode("utf-8"))
 
+    def stop_in_background(self, answer: Optional[str]) -> threading.Thread:
+        """A Stop hook of its own, as Claude Code runs it while a process the hook started is still at work."""
+        def stop() -> None:
+            try:
+                self.stop(answer)
+            except BaseException as e:
+                self.failures.append(e)
+        thread = threading.Thread(target=stop)
+        thread.start()
+        self.in_background.append(thread)
+        return thread
+
+    def wait_for_the_hooks_in_background(self) -> None:
+        in_background, self.in_background = self.in_background, []
+        for thread in in_background:
+            thread.join()
+        if self.failures:
+            raise self.failures[0]
+
 
 def no_process_can_start(monkeypatch: pytest.MonkeyPatch) -> None:
     def _cannot_start(*_: Any, **__: Any) -> Any:
@@ -99,6 +133,24 @@ def no_process_can_start(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def the_wait_for_the_final_answer_ends_after(hook_module: Any, monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
     monkeypatch.setattr(hook_module, "FINAL_ANSWER_WAIT_SECONDS", seconds)
+
+
+def the_next_turn_ends_while_the_waiting_process_flushes_in_vain(hook: Hook) -> None:
+    """The first flush, that of the process that waited for the final answer, is slow and lost; while it runs,
+    a short next turn ends and its Stop hook fires. Every later flush delivers."""
+    hook_module = hook.hook_module
+    flushes = 0
+
+    def flush(_client: Any) -> str:
+        nonlocal flushes
+        flushes += 1
+        if flushes > 1:
+            return hook_module.DELIVERED
+        a_short_next_turn(hook.transcript)
+        hook.stop_in_background(answer=NEXT_ANSWER).join(SLOW_FLUSH_SECONDS)
+        return hook_module.LOST
+
+    hook.monkeypatch.setattr(hook_module, "flush_and_shutdown_langfuse_client", flush)
 
 
 def turn_roots(fake_langfuse: Any) -> list[Any]:
@@ -121,6 +173,17 @@ def expect_each_step_sent_once(fake_langfuse: Any) -> None:
     assert len(turn_roots(fake_langfuse)) == 1, "the root of the turn was sent more than once"
     ids = [o.id for o in fake_langfuse.observations]
     assert len(ids) == len(set(ids)), "a step of the turn was sent twice"
+
+
+def expect_next_turn_sent_once(fake_langfuse: Any) -> None:
+    [trace_id] = {root.trace_id for root in turn_roots(fake_langfuse) if root.kwargs["input"]["content"] == NEXT_QUESTION}
+    ids = [o.id for o in fake_langfuse.observations if o.trace_id == trace_id]
+    assert len(ids) == len(set(ids)), "a step of the next turn was sent twice"
+
+
+def expect_lost_turn_sent_again(fake_langfuse: Any, answer: str) -> None:
+    generation_texts = [o.kwargs["output"].get("content") for o in fake_langfuse.observations if o.as_type == "generation"]
+    assert generation_texts.count(answer) == 2, "the turn whose flush was lost was not sent again, once"
 
 
 def expect_nothing_started(hook: Hook) -> None:

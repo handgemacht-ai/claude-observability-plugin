@@ -21,8 +21,8 @@ their own background task wakes), `03594c5` (rejected spans, smaller requests, t
 them in this order. Review fixes on top: `f1ff7c8` (a project folder the user cannot search), `b5fadd8` (journal results of a Workflow run split over two folders),
 `6eada7d` (tests of the notification guards), `beb3398` (a hand-back with a note before its marker), `f9034dd` (woken runs cut only at queued stops, helpers of helpers
 not cut), `300232b` (a woken run sent once), `e4cb416` (test of a `SendMessage` run after a woken run), `e2b83f5` (one flush budget between helpers), `0d7c9db` (replies to
-repeat notifications), `c122695` (the list of these fixes), `5c6b075` (back to one request per firing, rejected spans count as refused) and the commit that makes a `Stop` firing
-wait for its final answer; the whole suite passes after the last of them. "Before" in this entry is release `1.3.0-handgemacht.10`.
+repeat notifications), `c122695` (the list of these fixes), `5c6b075` (back to one request per firing, rejected spans count as refused), `fb07859` (a `Stop` firing waits for its final
+answer) and the commit that holds the session lock until a firing knows whether its spans arrived; the whole suite passes after the last of them. "Before" in this entry is release `1.3.0-handgemacht.10`.
 
 A read-only test of the behaviour gate on 4 November found about 3,400 records waiting, because the plugin never sent their step to Langfuse.
 The gate finds a step by the plugin's `Tool: <name>` observation (`metadata.tool_id`) or, for a final answer, by the plugin's LLM call
@@ -71,6 +71,10 @@ more of those steps.
   A `Stop` whose answer is in the log, or whose input has no `last_assistant_message`, fires at once as before, and so does one whose process cannot start. There is still one firing
   per `Stop`, so the session lock, the state and the root claims keep it apart from a `SessionEnd` or a later `Stop` of the session, as for any two firings. The user was shown three
   ways and did not choose; the main session chose this one as the default, since it neither holds up the session nor changes a `Stop` that has its answer.
+- **The session lock until a firing knows its outcome** (`main`). The review found that the waiting process can still be flushing when the `Stop` of a short next turn fires: the
+  firing released the session lock before its flush, so the next `Stop` went on from its saved progress and sent the next turn, and when the flush was then lost, its undo put back
+  the state from before both, and the next firing sent the steps of the next turn again under the same ids. A firing now holds the session lock until it knows whether its spans
+  arrived, so a firing of the session that comes meanwhile waits for it and goes on from the state it leaves.
 - `FORK.md` describes them. Version raised to `1.3.0-handgemacht.11` in `.claude-plugin/plugin.json`.
 
 **Why**
@@ -101,7 +105,7 @@ more of those steps.
   the hook ended after 0.49 seconds, its process waited until the answer was written 1.5 seconds after the start, then fired, and no process was left. Log lines: "the final answer of
   session <id> is not in the log yet; a process of its own waits for it and sends the turn", and after a wait in vain "the final answer did not reach the log within 10 s; sending the
   turn without it". In Langfuse, the root of the last turn of an idle session shows the final answer.
-- `uv run --group dev pytest`: 538 tests, 59 of them new (524 before the review fixes, run on Python 3.10 and 3.13; the review fixes were run on 3.13 only). Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
+- `uv run --group dev pytest`: 539 tests, 60 of them new (524 before the review fixes, run on Python 3.10 and 3.13; the review fixes were run on 3.13 only). Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
   11 of the 24 export tests fail; the others guard behaviour that must stay (`tests/unit/test_subagent_discovery.py`, `tests/integration/test_helpers_of_agents.py`,
   `tests/integration/test_notification_deliveries.py`, `tests/integration/test_woken_helpers.py`, `tests/integration/test_export_loss.py`,
   `tests/integration/test_final_answer_at_stop.py`, builders in `tests/session_files.py`, `tests/held_turns.py`, `tests/woken_helpers.py`, `tests/export_helpers.py` and
@@ -111,7 +115,8 @@ more of those steps.
   request per firing changes or adds; the `SessionEnd` case of its flush test passes before and after. The 4 guard tests (a remove row without a reason, `delivered_to_agent`, a hand-back next to another helper's queued
   notification, a `SendMessage` run after a woken run) pass before and fail only under the change they pin.
 - The final answer at `Stop`: 3 of its 7 tests fail before the fix (the answer written after the `Stop`, a wait in vain, a `SessionEnd` after the answer while the process waits); the
-  other 4 (answer already in the log, no `last_assistant_message`, no process can start, a `SessionEnd` before the answer) pass before and after.
+  other 4 (answer already in the log, no `last_assistant_message`, no process can start, a `SessionEnd` before the answer) pass before and after. Its eighth test, a next turn that
+  ends while the process flushes in vain, fails while the lock is released before the flush (a step of the next turn is sent twice) and passes after.
 
 **How to undo**
 - Revert the PR's commits and update the plugin. Release 10 reads helper files next to the log only, holds a turn as before, sends a woken helper once, does not read
@@ -152,6 +157,9 @@ more of those steps.
   for in vain, and a turn without a reply row of its own yet whose answer equals the one before counts as written. A `SessionEnd` that runs before the answer lands sends the turn without it,
   as before, since it has 1.5 seconds in total. The waiting process is not tracked: when it is stopped while it waits, the next firing of the session sends the turn. Not run on Windows, where
   the process starts with `DETACHED_PROCESS` and no console, nor checked on real sessions beyond the one run above with a synthetic log.
+- A firing now holds the session lock through its flush, which takes up to 5 seconds against a slow or failing Langfuse. A firing that waits longer than the lock's 2 seconds sends
+  nothing and leaves its turns to the next firing of the session, as it did when another firing held the lock for its emit; a `SessionEnd` that comes during a flush spends its
+  1.5 seconds waiting.
 - The commit hashes above are those of the pull request branch; a rebase merge gives them new hashes.
 
 ## 2026-11-02
