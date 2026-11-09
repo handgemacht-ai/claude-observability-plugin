@@ -3,6 +3,17 @@ from __future__ import annotations
 import errno
 import json
 
+from tests.session_files import (
+    WORKTREE_FOLDER,
+    a_session_whose_helper_has_its_meta_only_under_the_worktree_folder,
+    a_session_whose_helper_has_meta_and_transcript_in_both_folders,
+    a_session_whose_helper_wrote_under_a_worktree_folder,
+    a_session_whose_nested_helper_wrote_under_a_worktree_folder,
+    a_session_whose_old_helper_folder_was_superseded,
+    a_session_whose_workflow_run_wrote_under_a_worktree_folder,
+    expect_helper_read_from,
+)
+
 
 def test_discovers_subagent_transcripts_by_parent_tool_use_id(
     hook_module,
@@ -467,3 +478,54 @@ def test_ignores_bad_or_incomplete_subagent_metadata(hook_module, tmp_path):
     (subagent_dir / "agent-missing-tool-id.jsonl").write_text("", encoding="utf-8")
 
     assert hook_module.get_subagent_transcripts_by_tool_use_id(transcript) == {}
+
+
+def test_finds_helpers_whose_files_sit_under_the_project_folder_of_a_worktree(hook_module, tmp_path):
+    session = a_session_whose_helper_wrote_under_a_worktree_folder(tmp_path)
+
+    subagents = hook_module.get_subagent_transcripts_by_tool_use_id(session.transcript)
+
+    expect_helper_read_from(subagents, "toolu_helper", WORKTREE_FOLDER)
+    assert hook_module.get_task_id_to_tool_use_id(subagents) == {"helper": "toolu_helper"}
+
+
+def test_a_helper_with_meta_and_transcript_in_both_folders_is_read_from_the_folder_of_the_main_transcript(
+    hook_module, tmp_path
+):
+    session = a_session_whose_helper_has_meta_and_transcript_in_both_folders(tmp_path)
+
+    subagents = hook_module.get_subagent_transcripts_by_tool_use_id(session.transcript)
+
+    expect_helper_read_from(subagents, "toolu_helper", tmp_path.name)
+
+
+def test_a_helper_whose_meta_sits_only_under_the_worktree_folder_is_read_from_there(hook_module, tmp_path):
+    session = a_session_whose_helper_has_its_meta_only_under_the_worktree_folder(tmp_path)
+
+    subagents = hook_module.get_subagent_transcripts_by_tool_use_id(session.transcript)
+
+    expect_helper_read_from(subagents, "toolu_helper", WORKTREE_FOLDER)
+
+
+def test_a_nested_helper_under_the_worktree_folder_is_found_in_the_transcript_of_its_parent(hook_module, tmp_path):
+    session = a_session_whose_nested_helper_wrote_under_a_worktree_folder(tmp_path)
+
+    subagents = hook_module.get_subagent_transcripts_by_tool_use_id(session.transcript)
+
+    expect_helper_read_from(subagents, "toolu_inner", WORKTREE_FOLDER)
+
+
+def test_superseded_session_directories_are_not_read(hook_module, tmp_path):
+    session = a_session_whose_old_helper_folder_was_superseded(tmp_path)
+
+    subagents = hook_module.get_subagent_transcripts_by_tool_use_id(session.transcript)
+
+    assert subagents == {}
+
+
+def test_workflow_lookup_finds_runs_whose_files_sit_under_the_project_folder_of_a_worktree(hook_module, tmp_path):
+    session = a_session_whose_workflow_run_wrote_under_a_worktree_folder(tmp_path, "run_wt")
+
+    agents = hook_module.WorkflowAgentTranscriptsByRunId(session.transcript).get("run_wt")
+
+    assert [agent["agent_id"] for agent in agents or []] == ["step"]

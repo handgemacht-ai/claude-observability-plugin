@@ -66,11 +66,16 @@ class SessionDir:
     def write_main(self, rows: list[dict[str, Any]]) -> None:
         self.transcript.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
 
-    def add_agent(self, agent_id: str, rows: list[dict[str, Any]], meta: dict[str, Any],
-                  run: str | None = None) -> Path:
-        directory = self.subagents / "workflows" / run if run else self.subagents
+    def add_agent(self, agent_id: str, rows: list[dict[str, Any]], meta: dict[str, Any] | None,
+                  run: str | None = None, folder: str | None = None) -> Path:
+        """An agent's transcript and, unless meta is None, its meta. A folder names
+        another project folder next to the one of the main transcript: a session in
+        a worktree writes its agents under the worktree's project folder."""
+        subagents = self.transcript.parent.parent / folder / SESSION / "subagents" if folder else self.subagents
+        directory = subagents / "workflows" / run if run else subagents
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"agent-{agent_id}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        if meta is not None:
+            (directory / f"agent-{agent_id}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
         path = directory / f"agent-{agent_id}.jsonl"
         path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
         return path
@@ -93,3 +98,100 @@ def parent_with_skill_calls(calls: list[tuple[str, float, float]]) -> list[dict[
         rows.append(tool_result(f"p-result-{index}", ended, call_id,
                                 'Skill "code-review" completed (forked execution).'))
     return rows
+
+
+WORKTREE_FOLDER = "start-folder--claude-worktrees-feature"
+HELPER_META = {"agentType": "explorer", "description": "Look up", "toolUseId": "toolu_helper", "spawnDepth": 1}
+
+
+def helper_rows(at: float, tool_use_id: str = "toolu_helper_read") -> list[dict[str, Any]]:
+    """A helper that reads one file and answers."""
+    return [user("h-prompt", at, "Look it up."),
+            assistant("h-call", at + 1, [tool_use(tool_use_id, "Read", file_path="notes.md")]),
+            tool_result("h-result", at + 2, tool_use_id, "Notes."),
+            assistant("h-answer", at + 3, [{"type": "text", "text": "Found it."}])]
+
+
+def a_session_that_launched_a_helper(tmp_path: Path) -> SessionDir:
+    session = SessionDir(tmp_path)
+    session.write_main([
+        user("u1", 0, "Look it up."),
+        assistant("a1", 1, [tool_use("toolu_helper", "Agent", description="Look up", subagent_type="explorer")]),
+        tool_result("r1", 30, "toolu_helper", "Found it.", agentId="helper"),
+        assistant("a2", 31, [{"type": "text", "text": "Done."}]),
+    ])
+    return session
+
+
+def a_session_whose_helper_wrote_under_a_worktree_folder(tmp_path: Path) -> SessionDir:
+    """The main transcript stays in the folder the session started in, the helper's
+    files sit under the project folder of the worktree the session entered."""
+    session = a_session_that_launched_a_helper(tmp_path)
+    session.add_agent("helper", helper_rows(10), HELPER_META, folder=WORKTREE_FOLDER)
+    return session
+
+
+def a_session_whose_helper_has_meta_and_transcript_in_both_folders(tmp_path: Path) -> SessionDir:
+    session = a_session_that_launched_a_helper(tmp_path)
+    session.add_agent("helper", helper_rows(10), HELPER_META)
+    session.add_agent("helper", helper_rows(20), HELPER_META, folder=WORKTREE_FOLDER)
+    return session
+
+
+def a_session_whose_helper_has_its_meta_only_under_the_worktree_folder(tmp_path: Path) -> SessionDir:
+    session = a_session_that_launched_a_helper(tmp_path)
+    session.add_agent("helper", helper_rows(20), None)
+    session.add_agent("helper", helper_rows(10), HELPER_META, folder=WORKTREE_FOLDER)
+    return session
+
+
+def a_session_whose_nested_helper_wrote_under_a_worktree_folder(tmp_path: Path) -> SessionDir:
+    """A helper launched by another helper: its meta names its parent, not a launch."""
+    session = a_session_that_launched_a_helper(tmp_path)
+    outer = [user("o-prompt", 2, "Look it up."),
+             assistant("o-call", 3, [tool_use("toolu_inner", "Agent", description="Dig", subagent_type="explorer")]),
+             tool_result("o-result", 20, "toolu_inner", "Dug.", agentId="inner"),
+             assistant("o-answer", 21, [{"type": "text", "text": "Found it."}])]
+    session.add_agent("helper", outer, HELPER_META, folder=WORKTREE_FOLDER)
+    session.add_agent("inner", helper_rows(4), {"agentType": "explorer", "spawnDepth": 2, "parentAgentId": "helper"},
+                      folder=WORKTREE_FOLDER)
+    return session
+
+
+def a_session_whose_workflow_run_wrote_under_a_worktree_folder(tmp_path: Path, run: str) -> SessionDir:
+    session = SessionDir(tmp_path)
+    session.add_agent("step", helper_rows(10), {"agentType": "workflow-subagent", "spawnDepth": 1},
+                      run=run, folder=WORKTREE_FOLDER)
+    return session
+
+
+def a_session_whose_old_helper_folder_was_superseded(tmp_path: Path) -> SessionDir:
+    """Claude Code renames a session directory it replaces to <session>.superseded-<ms>."""
+    session = a_session_that_launched_a_helper(tmp_path)
+    superseded = tmp_path.parent / WORKTREE_FOLDER / f"{SESSION}.superseded-1700000000000" / "subagents"
+    superseded.mkdir(parents=True)
+    (superseded / "agent-helper.meta.json").write_text(json.dumps(HELPER_META), encoding="utf-8")
+    (superseded / "agent-helper.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in helper_rows(10)), encoding="utf-8")
+    return session
+
+
+def expect_helper_read_from(subagents: dict[str, dict[str, Any]], tool_use_id: str, folder: str) -> None:
+    """The helper launched by the call was read from the subagents/ directory under the project folder."""
+    assert tool_use_id in subagents, sorted(subagents)
+    assert subagents[tool_use_id]["path"].parent.parent.parent.name == folder
+
+
+def expect_tool_step_sent(fake_langfuse: Any, name: str, tool_use_id: str) -> None:
+    assert [o.name for o in fake_langfuse.observations
+            if o.kwargs.get("metadata", {}).get("tool_id") == tool_use_id] == [f"Tool: {name}"]
+
+
+def expect_llm_call_of_agent_sent(fake_langfuse: Any, agent_id: str) -> None:
+    assert [o for o in fake_langfuse.observations
+            if o.as_type == "generation" and o.kwargs.get("metadata", {}).get("agent_id") == agent_id]
+
+
+def expect_one_log_line(state_dir: Path, text: str) -> None:
+    log = (state_dir / "langfuse_hook.log").read_text(encoding="utf-8")
+    assert log.count(text) == 1, log
