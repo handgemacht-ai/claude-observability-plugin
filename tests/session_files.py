@@ -175,6 +175,47 @@ def a_resumed_helper_that_did_not_hand_back_again() -> list[dict[str, Any]]:
     ]
 
 
+HELPER_BACKGROUND_CALL = "toolu_helper_bash"
+HELPER_LATER_CALL = "toolu_helper_read"
+
+
+def notification_of_a_later_stop(task_id: str = HELPER_TASK) -> str:
+    """A helper that stops again is reported without the call that launched it."""
+    return (f"<task-notification>\n<task-id>{task_id}</task-id>\n<status>completed</status>\n"
+            "<summary>Waiting on its own background task.</summary>\n</task-notification>")
+
+
+def a_helper_that_waits_on_its_own_background_task() -> list[dict[str, Any]]:
+    return [user("h-prompt", 2.5, "Look."),
+            assistant("h-a1", 4, [tool_use(HELPER_BACKGROUND_CALL, "Bash", command="make test",
+                                           run_in_background=True)]),
+            tool_result("h-r1", 5, HELPER_BACKGROUND_CALL, "Running in the background."),
+            answer("h-a2", 9, "Waiting for the test run.")]
+
+
+def woken_by_its_background_task(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    note = "Background task event.\n" + notification_text("bash-1", HELPER_BACKGROUND_CALL)
+    return rows + [user("h-wake", 20, note, isMeta=True, origin={"kind": "task-notification"}),
+                   assistant("h-a3", 21, [tool_use(HELPER_LATER_CALL, "Read", file_path="report.txt")]),
+                   tool_result("h-r2", 22, HELPER_LATER_CALL, "All passed.")]
+
+
+def stopped_again(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return rows + [answer("h-a4", 25, "The test run passed.")]
+
+
+def a_main_turn_answered_at_the_helper_first_stop() -> list[dict[str, Any]]:
+    return a_turn_that_launched_a_helper() + [queued(10, notification_text()),
+                                              delivered("n1", 10.1, notification_text()),
+                                              answer("a3", 11, "The helper waits on its test run.")]
+
+
+def answered_at_the_helper_later_stop(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return rows + [queued(30, notification_of_a_later_stop()),
+                   delivered("n2", 30.1, notification_of_a_later_stop()),
+                   answer("a4", 31, "The helper is done.")]
+
+
 FORKED = {"agentType": "general-purpose", "isBuiltIn": True, "spawnDepth": 2}
 
 
