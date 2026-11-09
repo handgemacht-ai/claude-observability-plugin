@@ -81,6 +81,15 @@ class SessionDir:
         path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
         return path
 
+    def add_journal(self, run: str, results: dict[str, Any]) -> None:
+        """The journal of a Workflow run, next to the main transcript: one result row per finished agent."""
+        directory = self.subagents / "workflows" / run
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "journal.jsonl").write_text(
+            "".join(json.dumps({"type": "result", "agentId": agent_id, "result": result}) + "\n"
+                    for agent_id, result in results.items()),
+            encoding="utf-8")
+
 
 def a_session_with(tmp_path: Path, rows: list[dict[str, Any]]) -> SessionDir:
     session = SessionDir(tmp_path)
@@ -299,6 +308,23 @@ def a_session_whose_workflow_run_wrote_under_a_worktree_folder(tmp_path: Path, r
     session.add_agent("step", helper_rows(10), {"agentType": "workflow-subagent", "spawnDepth": 1},
                       run=run, folder=WORKTREE_FOLDER)
     return session
+
+
+WORKFLOW_RESULTS = {"first": {"verdict": "first holds"}, "second": {"verdict": "second holds"}}
+
+
+def a_session_whose_workflow_run_is_split_over_two_folders(tmp_path: Path, run: str) -> SessionDir:
+    """The run's journal and its first agent sit next to the main transcript, its later agent under the worktree's folder."""
+    session = SessionDir(tmp_path)
+    workflow_meta = {"agentType": "workflow-subagent", "spawnDepth": 1}
+    session.add_agent("first", helper_rows(10), workflow_meta, run=run)
+    session.add_agent("second", helper_rows(20), workflow_meta, run=run, folder=WORKTREE_FOLDER)
+    session.add_journal(run, WORKFLOW_RESULTS)
+    return session
+
+
+def expect_workflow_results(agents: list[dict[str, Any]] | None, results: dict[str, Any]) -> None:
+    assert {agent["agent_id"]: agent["result"] for agent in agents or []} == results
 
 
 def a_session_whose_old_helper_folder_was_superseded(tmp_path: Path) -> SessionDir:

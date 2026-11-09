@@ -4,6 +4,7 @@ import errno
 import json
 
 from tests.session_files import (
+    WORKFLOW_RESULTS,
     WORKTREE_FOLDER,
     a_project_folder_the_user_cannot_search,
     a_session_whose_helper_has_its_meta_only_under_the_worktree_folder,
@@ -11,8 +12,10 @@ from tests.session_files import (
     a_session_whose_helper_wrote_under_a_worktree_folder,
     a_session_whose_nested_helper_wrote_under_a_worktree_folder,
     a_session_whose_old_helper_folder_was_superseded,
+    a_session_whose_workflow_run_is_split_over_two_folders,
     a_session_whose_workflow_run_wrote_under_a_worktree_folder,
     expect_helper_read_from,
+    expect_workflow_results,
 )
 
 
@@ -539,3 +542,13 @@ def test_workflow_lookup_finds_runs_whose_files_sit_under_the_project_folder_of_
     agents = hook_module.WorkflowAgentTranscriptsByRunId(session.transcript).get("run_wt")
 
     assert [agent["agent_id"] for agent in agents or []] == ["step"]
+
+
+def test_workflow_agents_of_a_run_split_over_two_folders_get_their_results_from_the_journal_in_either(
+    hook_module, tmp_path
+):
+    session = a_session_whose_workflow_run_is_split_over_two_folders(tmp_path, "run_split")
+
+    agents = hook_module.WorkflowAgentTranscriptsByRunId(session.transcript).get("run_split")
+
+    expect_workflow_results(agents, WORKFLOW_RESULTS)
