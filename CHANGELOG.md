@@ -39,7 +39,7 @@ more of those steps.
   2.1.31x also writes it as an attachment to the running turn, as a queue `remove` row that names its reason (`absorbed_mid_turn`, `delivered_to_agent`) and
   as the helper's hand-back (a peer message whose origin has `handback: true` or whose text starts with `[Subagent hand-back]`; auto mode can put a note before that text). All of them count as delivered now. The result of a helper's own background
   task, which the main log only queues and removes, no longer holds the main turn. A notification that arrives again after its helper handed back and the hand-back
-  was answered no longer waits for an answer it never gets. A hand-back or an attached notification after the last answer still holds the turn until the agent has answered.
+  was answered no longer holds the turn. A hand-back or an attached notification after the last answer still holds the turn until the agent has answered.
   Attachment rows only feed the hold check, so tool results and end times stay as they were.
 - **Helpers that their own background task wakes** (`get_agent_wakes_from_rows`, `emit_woken_agent_runs`). A helper was sent once, at its first stop. When a background task of its own
   woke it afterwards, the rows it wrote after the wake formed no run and no later firing sent them. A wake is the helper's own task notification as a user row after the helper stopped
@@ -102,8 +102,9 @@ more of those steps.
 - A remove row counts as delivered only when it names a reason. Rows without one (older Claude Code) still hold the turn, the safe direction. Upstream (langfuse/Claude-Observability-Plugin) PR 113 counts every remove row; this is a choice.
 - A hand-back is recognised by a peer message whose origin has `handback: true` (all 2,541 hand-backs in the logs) or whose text starts with `[Subagent hand-back]`. If both change, turns are held again and the old bug is back.
 - A turn is still held in the short gap between a notification's enqueue and its remove row; in the examples the remove row came within seconds.
-- Not checked: 132 repeat notifications after a hand-back that were followed by an assistant row. It is open whether any of them was a real answer after the final answer; the named examples were never answered.
-  Worth checking against the gate's waiting records. Upstream's mapping of background-task ids to their tool calls is not part of this change.
+- A repeat notification after an answered hand-back can get a reply: in the local logs about 115 to 125 of about 820 such repeats are directly followed by an assistant row (mostly a restated
+  status or "nothing new"; in d88a6b60 a new answer). The turn is sent at the hand-back's answer, so such a reply goes out as an LLM call of the turn, and the turn's root keeps the earlier
+  answer and an end time a few seconds earlier, since a root is sent once. Holding the turn for the repeat would hold the other six in seven until the next prompt, the bug this change fixes. Upstream's mapping of background-task ids to their tool calls is not part of this change.
 - A helper woken after its `SubagentHandback` call counts as woken. The change relies on the queued-notification rows that Claude Code 2.1.31x writes in the main log, and does not cover helpers of helpers that
   their own tasks wake (they are sent whole with their parent, so rows they write after that are still missing, as in release 10) nor a wake row whose text starts directly with `<task-notification>`. A woken run sits under the span of the main turn that holds the
   helper's next stop, not under the original `Agent` call. Each firing reads again the log of each helper that has a queued notification in the open turn, a small extra cost.
