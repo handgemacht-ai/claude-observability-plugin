@@ -10,9 +10,11 @@ import pytest
 from tests.export_helpers import (
     Answer,
     a_session_with_one_question,
+    a_session_with_three_helpers,
     a_session_with_two_helpers,
     a_span_batch,
     a_watch_of_the_exports,
+    each_flush_takes,
     expect_logged,
     expect_not_logged,
     expect_verdict,
@@ -236,6 +238,32 @@ def test_flushing_between_helpers_stops_after_a_flush_that_does_not_finish_in_ti
         release.set()
 
     assert len(flushes_before_the_end(fake_langfuse)) == 1
+    expect_logged(hook_module, "did not finish")
+
+
+def test_flushing_between_helpers_stops_after_a_flush_whose_batch_did_not_reach_langfuse(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
+):
+    session = a_session_with_two_helpers(tmp_path)
+    langfuse_answers(monkeypatch, [Answer(503), Answer(200), Answer(200)])
+    langfuse_gets_a_span_batch_when_flushed(fake_langfuse)
+
+    run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch, event="Stop")
+
+    assert len(flushes_before_the_end(fake_langfuse)) == 1
+    expect_logged(hook_module, "did not reach Langfuse")
+
+
+def test_the_flushes_between_helpers_share_one_flush_timeout(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
+):
+    session = a_session_with_three_helpers(tmp_path)
+    monkeypatch.setattr(hook_module, "FLUSH_TIMEOUT_SECONDS", 0.25)
+    each_flush_takes(fake_langfuse, 0.15)
+
+    run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch, event="Stop")
+
+    assert len(flushes_before_the_end(fake_langfuse)) == 2
     expect_logged(hook_module, "did not finish")
 
 

@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,23 @@ def a_session_with_two_helpers(tmp_path: Path) -> SessionDir:
     return session
 
 
+def a_session_with_three_helpers(tmp_path: Path) -> SessionDir:
+    session = a_session_with_two_helpers(tmp_path)
+    session.write_main([
+        user("u1", 0, "Check all three."),
+        assistant("a1", 1, [tool_use(f"toolu_{agent_id}", "Agent", description=agent_id.title(), subagent_type="checker")
+                            for agent_id in ("first", "second", "third")]),
+        tool_result("r1", 50, "toolu_first", "First done.", agentId="first"),
+        tool_result("r2", 51, "toolu_second", "Second done.", agentId="second"),
+        tool_result("r3", 52, "toolu_third", "Third done.", agentId="third"),
+        assistant("a2", 53, [{"type": "text", "text": "Done."}]),
+    ])
+    session.add_agent("third", [user("third-prompt", 2, "Third task."),
+                                assistant("third-answer", 3, [{"type": "text", "text": "Done."}])],
+                      {"agentType": "checker", "description": "Third", "toolUseId": "toolu_third", "spawnDepth": 1})
+    return session
+
+
 def run_a_firing_in_a_new_process(hook_module: Any, fake_langfuse: Any, session: SessionDir,
                                   monkeypatch: pytest.MonkeyPatch, event: str = "Stop") -> None:
     """Runs main() as Claude Code does for the hook event, with the exports of an earlier process forgotten."""
@@ -139,6 +157,10 @@ def run_a_firing_in_a_new_process(hook_module: Any, fake_langfuse: Any, session:
 
 def langfuse_gets_a_span_batch_when_flushed(fake_langfuse: Any) -> None:
     fake_langfuse.on_flush = lambda: send_to_langfuse(a_span_batch())
+
+
+def each_flush_takes(fake_langfuse: Any, seconds: float) -> None:
+    fake_langfuse.on_flush = lambda: time.sleep(seconds)
 
 
 def turns_sent(fake_langfuse: Any) -> int:

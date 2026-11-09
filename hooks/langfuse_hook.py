@@ -5898,12 +5898,15 @@ class PieceFlush:
     a few hundred spans goes out in several requests; the flush gives each piece a request
     of its own at its end. It is off in a SessionEnd firing: Claude Code stops that hook
     after 1.5 seconds in total, and the wait would use that time before the progress is
-    saved. A flush that does not finish in time ends the flushing between pieces; the flush
-    at the end of the firing tells what did not arrive."""
+    saved. The flushes between pieces get FLUSH_TIMEOUT_SECONDS in total, and a flush whose
+    batch did not reach Langfuse ends them too: with Langfuse down each flush takes about
+    3 seconds, for every helper of the firing. The flush at the end of the firing tells
+    what did not arrive."""
 
     def __init__(self) -> None:
         self.enabled = False
         self.given_up = False
+        self.spent = 0.0
 
     def after_piece(self, langfuse: Any) -> None:
         if not self.enabled or self.given_up:
@@ -5913,13 +5916,18 @@ class PieceFlush:
             with contextlib.suppress(Exception):
                 langfuse.flush()
 
+        started = time.monotonic()
         thread = threading.Thread(target=_flush, daemon=True)
         thread.start()
-        thread.join(FLUSH_TIMEOUT_SECONDS)
+        thread.join(FLUSH_TIMEOUT_SECONDS - self.spent)
+        self.spent += time.monotonic() - started
         if thread.is_alive():
             self.given_up = True
-            info(f"flush between helpers did not finish within {FLUSH_TIMEOUT_SECONDS:g} s; "
+            info(f"flushes between helpers did not finish within {FLUSH_TIMEOUT_SECONDS:g} s in total; "
                  f"the rest is sent at the end")
+        elif EXPORT_WATCH.verdict() != DELIVERED:
+            self.given_up = True
+            info("a flush between helpers did not reach Langfuse; the rest is sent at the end")
 
 PIECE_FLUSH = PieceFlush()
 
