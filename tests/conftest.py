@@ -7,6 +7,7 @@ import importlib.util
 import json
 import logging
 import os
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -135,9 +136,25 @@ def hook_module() -> Any:
 
 
 @pytest.fixture
-def fixture_transcript_path() -> Any:
+def tmp_path(tmp_path: Path) -> Path:
+    """A project folder in a projects root of its own: the hook reads the agent
+    files of a session under every project folder of the root, and the tests
+    share session names."""
+    project = tmp_path / "project"
+    project.mkdir()
+    return project
+
+
+@pytest.fixture
+def fixture_transcript_path(tmp_path_factory: pytest.TempPathFactory) -> Any:
+    # A copy in a projects root of its own: every fixture names its session "transcript".
+    copies: dict[str, Path] = {}
+
     def _path(name: str) -> Path:
-        return FIXTURE_ROOT / name / "transcript.jsonl"
+        if name not in copies:
+            copies[name] = tmp_path_factory.mktemp("projects") / name
+            shutil.copytree(FIXTURE_ROOT / name, copies[name])
+        return copies[name] / "transcript.jsonl"
 
     return _path
 

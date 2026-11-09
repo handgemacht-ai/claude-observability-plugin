@@ -1988,21 +1988,58 @@ def match_agents_to_skill_calls(
 def is_plain_file_name(value: Any) -> bool:
     return isinstance(value, str) and bool(value) and value not in (".", "..") and value == Path(value).name
 
-def find_agent_transcript(subagent_dir: Path, agent_id: Any) -> Optional[Path]:
+def get_session_subagent_dirs(transcript_path: Path) -> List[Path]:
+    """The subagents/ directories of a session: the one next to its transcript
+    first, whether or not it exists, then those under other project folders.
+
+    A session that entered a worktree writes its agents under the project folder
+    of the worktree, while its transcript stays in the folder it started in. One
+    scan of the projects root finds them."""
+    session_dir = transcript_path.with_suffix("")
+    try:
+        project_dirs = sorted(transcript_path.parent.parent.iterdir())
+    except OSError:
+        project_dirs = []
+    other_dirs = [
+        project_dir / session_dir.name / "subagents" for project_dir in project_dirs
+        if project_dir != transcript_path.parent and (project_dir / session_dir.name / "subagents").is_dir()
+    ]
+    if other_dirs:
+        info(f"session {session_dir.name} has agent files in other project folders: "
+             + ", ".join(subagent_dir.parent.parent.name for subagent_dir in other_dirs))
+    return [session_dir / "subagents"] + other_dirs
+
+def get_agent_meta_paths(directories: List[Path], pattern: str) -> List[Path]:
+    """The meta of each agent, from the first directory that holds both its meta and its transcript.
+
+    A session in a worktree can leave files of one agent in two project folders."""
+    meta_paths: Dict[str, Path] = {}
+    for directory in directories:
+        for meta_path in directory.glob(pattern):
+            if meta_path.name not in meta_paths and resolve_agent_jsonl_and_id(meta_path) is not None:
+                meta_paths[meta_path.name] = meta_path
+    return sorted(meta_paths.values(), key=lambda meta_path: meta_path.name)
+
+def find_agent_transcript(subagent_dirs: List[Path], agent_id: Any) -> Optional[Path]:
     """The transcript of an agent: flat in subagents/, or in the run directory of a Workflow agent.
+    The first directory that has it wins.
 
     The agent id comes from transcript data and makes a path, so only a plain
     name is accepted."""
     if not is_plain_file_name(agent_id):
         return None
     name = f"agent-{agent_id}.jsonl"
-    flat = subagent_dir / name
-    if flat.is_file():
-        return flat
-    try:
-        return next(iter(sorted((subagent_dir / "workflows").glob(f"*/{name}"))), None)
-    except OSError:
-        return None
+    for subagent_dir in subagent_dirs:
+        flat = subagent_dir / name
+        if flat.is_file():
+            return flat
+        try:
+            in_run = next(iter(sorted((subagent_dir / "workflows").glob(f"*/{name}"))), None)
+        except OSError:
+            in_run = None
+        if in_run is not None:
+            return in_run
+    return None
 
 def describe_skill_call(tool_input: Dict[str, Any]) -> Optional[str]:
     skill = tool_input.get("skill")
@@ -2011,17 +2048,22 @@ def describe_skill_call(tool_input: Dict[str, Any]) -> Optional[str]:
     args = tool_input.get("args")
     return f"/{skill} {args}".strip() if isinstance(args, str) else f"/{skill}"
 
-def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
+def get_subagent_transcripts_by_tool_use_id(
+    transcript_path: Path, subagent_dirs: Optional[List[Path]] = None,
+) -> Dict[str, Dict[str, Any]]:
     """Map launching tool_use ids to their subagent transcripts.
 
     Every depth lives flat in subagents/, and Workflow agents in
-    subagents/workflows/<run>/. A meta names its launching call (toolUseId), or
+    subagents/workflows/<run>/; a session in a worktree has such a directory
+    under more than one project folder. A meta names its launching call (toolUseId), or
     the launch is found in the transcript of the agent that started the agent
     (parentAgentId, or the main transcript): the Agent, Task or Skill call whose
     result names the agent id, or the Skill call that was running when a forked
     skill agent started."""
-    subagent_dir = transcript_path.with_suffix("") / "subagents"
-    if not subagent_dir.is_dir():
+    if subagent_dirs is None:
+        subagent_dirs = get_session_subagent_dirs(transcript_path)
+    subagent_dirs = [subagent_dir for subagent_dir in subagent_dirs if subagent_dir.is_dir()]
+    if not subagent_dirs:
         return {}
 
     # The fallback maps are built only when a meta has no toolUseId.
@@ -2069,7 +2111,7 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
             return
         subagent_transcripts_by_tool_use_id[tool_use_id] = entry
 
-    for meta_path in sorted(subagent_dir.glob("*.meta.json")):
+    for meta_path in get_agent_meta_paths(subagent_dirs, "*.meta.json"):
         try:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
@@ -2096,7 +2138,7 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
             # A meta rewritten at a resume can lose toolUseId, and an agent that another
             # agent started has none. The result of the launching call names the agent id;
             # it sits in the transcript of the agent that started it, else in the main one.
-            parent_path = find_agent_transcript(subagent_dir, metadata.get("parentAgentId"))
+            parent_path = find_agent_transcript(subagent_dirs, metadata.get("parentAgentId"))
             for launcher_path in ([parent_path] if parent_path is not None else []) + [transcript_path]:
                 tool_use_id, launch_input = launches_in(launcher_path).get(agent_id, ("", {}))
                 if tool_use_id:
@@ -2216,13 +2258,16 @@ def get_workflow_agents_in_run_dir(run_dir: Path) -> List[Dict[str, Any]]:
 class WorkflowAgentTranscriptsByRunId:
     """Per-run lookup of workflow-spawned agent transcripts. It reads on demand.
 
-    The first lookup of a run id reads that run directory. The lookup then keeps
+    The first lookup of a run id reads the directories of that run, one per
+    subagents/ directory of the session; an agent found in more than one comes
+    from the first. The lookup then keeps
     the result for its own life, which is one hook firing. Thus only a firing
     that emits a reference to a run reads that run, and it always reads the
     current files."""
 
-    def __init__(self, transcript_path: Path) -> None:
-        self._workflows_dir = transcript_path.with_suffix("") / "subagents" / "workflows"
+    def __init__(self, transcript_path: Path, subagent_dirs: Optional[List[Path]] = None) -> None:
+        self._transcript_path = transcript_path
+        self._subagent_dirs = subagent_dirs
         self._agents_by_run_id: Dict[str, List[Dict[str, Any]]] = {}
 
     def get(self, run_id: Optional[str]) -> Optional[List[Dict[str, Any]]]:
@@ -2235,8 +2280,14 @@ class WorkflowAgentTranscriptsByRunId:
         if run_id == ".." or run_id != Path(run_id).name:
             return None
         if run_id not in self._agents_by_run_id:
+            if self._subagent_dirs is None:
+                self._subagent_dirs = get_session_subagent_dirs(self._transcript_path)
+            agents_by_id: Dict[str, Dict[str, Any]] = {}
             try:
-                agents = get_workflow_agents_in_run_dir(self._workflows_dir / run_id)
+                for subagent_dir in self._subagent_dirs:
+                    for agent in get_workflow_agents_in_run_dir(subagent_dir / "workflows" / run_id):
+                        agents_by_id.setdefault(agent["agent_id"], agent)
+                agents = list(agents_by_id.values())
             except OSError as e:
                 # The file system can refuse a run path, for example when the
                 # name is too long. Such a failure must not stop the turn.
@@ -4301,8 +4352,8 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     """Emit one agent run as an agent observation, its own launches nested
     under their tool spans at any depth.
 
-    All agents of a session share one flat subagents/ directory, so the
-    same tool_use-keyed map serves every level. The ancestry guard stops
+    All agents of a session are in one tool_use-keyed map, whichever
+    subagents/ directory holds them, so the same map serves every level. The ancestry guard stops
     cycles, MAX_AGENT_DEPTH stops runaway trees, and a missing or empty
     transcript emits nothing.
     """
@@ -5320,11 +5371,12 @@ def emit_new_turns_from_transcript(
         key, superseded_keys = resolve_session_state_key(state, session_id, transcript_path)
         session_state = get_session_state(state, key)
 
-        subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
+        subagent_dirs = get_session_subagent_dirs(transcript_path)
+        subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path, subagent_dirs)
         if subagent_transcripts_by_tool_use_id:
             debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
 
-        workflow_agent_transcripts_by_run_id = WorkflowAgentTranscriptsByRunId(transcript_path)
+        workflow_agent_transcripts_by_run_id = WorkflowAgentTranscriptsByRunId(transcript_path, subagent_dirs)
 
         turns, session_state = get_new_turns_from_transcript(
             transcript_path,

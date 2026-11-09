@@ -6,7 +6,11 @@ from tests.session_files import (
     FORKED,
     SESSION,
     SessionDir,
+    a_session_whose_helper_wrote_under_a_worktree_folder,
     assistant,
+    expect_llm_call_of_agent_sent,
+    expect_one_log_line,
+    expect_tool_step_sent,
     fork_rows,
     parent_with_skill_calls,
     tool_result,
@@ -157,3 +161,15 @@ def test_helper_without_a_launching_call_adds_no_observation(
 
     assert named(fake_langfuse, "Subagent: general-purpose") == []
     assert len(named(fake_langfuse, "Subagent: reviewer")) == 1
+
+
+def test_helper_whose_files_sit_under_the_project_folder_of_a_worktree_sends_its_steps(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path
+):
+    session = a_session_whose_helper_wrote_under_a_worktree_folder(tmp_path)
+
+    emit(hook_module, fake_langfuse, session)
+
+    expect_tool_step_sent(fake_langfuse, "Read", "toolu_helper_read")
+    expect_llm_call_of_agent_sent(fake_langfuse, "helper")
+    expect_one_log_line(isolated_hook_state, "agent files in other project folders")
