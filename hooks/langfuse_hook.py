@@ -357,6 +357,37 @@ def info(msg: str) -> None:
             pass
 
 
+# The OpenTelemetry exporter and the Langfuse SDK report what they drop or fail to
+# send on their own loggers, which nothing reads in a hook; the plugin log gets
+# their warnings and errors.
+SDK_LOGGERS = ("opentelemetry", "langfuse")
+
+class SdkLogRelay(logging.Handler):
+    def __init__(self, target: logging.Logger) -> None:
+        super().__init__(level=logging.WARNING)
+        self.target = target
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+            if record.exc_info and record.exc_info[1] is not None:
+                message += f" ({type(record.exc_info[1]).__name__}: {record.exc_info[1]})"
+            self.target.log(record.levelno, f"{record.name}: {message}")
+        except Exception:
+            pass
+
+def route_sdk_warnings_to_log() -> None:
+    target = _get_logger()
+    if target is None:
+        return
+    for name in SDK_LOGGERS:
+        sdk_logger = logging.getLogger(name)
+        if not any(isinstance(h, SdkLogRelay) for h in sdk_logger.handlers):
+            sdk_logger.addHandler(SdkLogRelay(target))
+        if not sdk_logger.isEnabledFor(logging.WARNING):
+            sdk_logger.setLevel(logging.WARNING)
+
+
 # ----------------- Langfuse import (fail-open) -----------------
 # Everything above this guard runs before the SDK import and must stay
 # stdlib-only and parseable on Python 3.9 so this failure path can log.
@@ -391,6 +422,10 @@ def read_plugin_version() -> Optional[str]:
         return None
 
 
+# The SDK sends a request when 512 spans are queued, and the rest at the end, so a held turn
+# of 427 spans of about 100 KB each went out as one request of 44 MB. 25 spans are about 2.5 MB.
+EXPORT_BATCH_SPANS = 25
+
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
     # With capture off, stop the SDK from uploading base64 images it finds
     # in span payloads on its own. The SDK reads an empty value as enabled.
@@ -402,6 +437,7 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
             secret_key=config.secret_key,
             host=config.host,
             release=read_plugin_version(),
+            flush_at=None if os.environ.get("LANGFUSE_FLUSH_AT") else EXPORT_BATCH_SPANS,
         )
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
@@ -4678,6 +4714,8 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             _get_latest_timestamp(latest_end_timestamp, subagent_start_timestamp)
         )
     )
+    if nesting.depth == 0:
+        PIECE_FLUSH.after_piece(langfuse)
 
     return latest_end_timestamp
 
@@ -5654,7 +5692,7 @@ def emit_new_turns_from_transcript(
             session_context=session_context,
         )
 
-        # Progress is persisted before the SDK flush in main(), so a dropped
+        # Progress is persisted before the final SDK flush in main(), so a dropped
         # flush leaves emitted_keys pointing at spans that never reached the
         # server. main() puts the state back when it sees the delivery fail;
         # the note left here lets the next firing do the same when this
@@ -5675,8 +5713,8 @@ def emit_new_turns_from_transcript(
 
 FLUSH_TIMEOUT_SECONDS = 5.0
 
-# What became of the spans a process sent. "lost": a batch failed or did not
-# finish, so sending it again can work. "refused": Langfuse answered with an
+# What became of the spans a process sent. "lost": a batch failed, did not
+# finish or had spans that Langfuse rejected, so sending it again can work. "refused": Langfuse answered with an
 # error that sending again does not change (a wrong key, a batch that is too big).
 DELIVERED = "delivered"
 LOST = "lost"
@@ -5684,7 +5722,8 @@ REFUSED = "refused"
 RETRYABLE_STATUS_CODES = (408, 425, 429)
 
 class ExportWatch:
-    """What this process saw of its span exports: the batches that Langfuse refused or never answered.
+    """What this process saw of its span exports: the batches that Langfuse refused, never answered
+    or took only in part.
 
     The SDK's flush returns nothing and swallows errors, so a lost batch
     cannot be seen there. The OTLP exporter sends with requests, and every
@@ -5694,11 +5733,12 @@ class ExportWatch:
     def __init__(self) -> None:
         self.last_try: Dict[Any, str] = {}
 
-    def record(self, body: Any, status_code: Optional[int]) -> None:
-        """status_code is None when the batch got no answer."""
+    def record(self, body: Any, status_code: Optional[int], rejected_spans: int = 0) -> None:
+        """status_code is None when the batch got no answer. A batch of which Langfuse
+        rejected spans, though it answered with a success, counts as lost."""
         key = hashlib.sha256(body).digest() if isinstance(body, (bytes, bytearray)) else len(self.last_try)
         if status_code is not None and status_code < 400:
-            self.last_try[key] = DELIVERED
+            self.last_try[key] = LOST if rejected_spans > 0 else DELIVERED
         elif status_code is None or status_code >= 500 or status_code in RETRYABLE_STATUS_CODES:
             self.last_try[key] = LOST
         else:
@@ -5709,6 +5749,60 @@ class ExportWatch:
         return LOST if LOST in outcomes else REFUSED if REFUSED in outcomes else DELIVERED
 
 EXPORT_WATCH = ExportWatch()
+
+def _read_varint(data: bytes, position: int) -> Tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = data[position]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, position
+        shift += 7
+
+def _protobuf_fields(data: bytes) -> Iterator[Tuple[int, Any]]:
+    """The (field number, value) pairs of a protobuf message: an int for a varint, bytes for
+    a length-delimited field. Fixed-size fields are skipped; a group ends the message."""
+    position = 0
+    while position < len(data):
+        tag, position = _read_varint(data, position)
+        number, wire_type = tag >> 3, tag & 7
+        if wire_type == 0:
+            value, position = _read_varint(data, position)
+        elif wire_type == 2:
+            length, position = _read_varint(data, position)
+            value, position = data[position:position + length], position + length
+        elif wire_type in (1, 5):
+            position += 8 if wire_type == 1 else 4
+            continue
+        else:
+            return
+        yield number, value
+
+def read_partial_success(content: Any) -> Tuple[int, str]:
+    """(rejected_spans, error_message) from the body of an OTLP export response, in protobuf
+    or JSON; (0, "") when it has none or is not an OTLP response."""
+    rejected_spans, error_message = 0, ""
+    if not isinstance(content, (bytes, bytearray)):
+        return 0, ""
+    try:
+        if content.lstrip()[:1] == b"{":
+            body = json.loads(content)
+            partial_success = body.get("partialSuccess") or body.get("partial_success") or {}
+            rejected_spans = int(partial_success.get("rejectedSpans") or partial_success.get("rejected_spans") or 0)
+            error_message = str(partial_success.get("errorMessage") or partial_success.get("error_message") or "")
+        else:
+            for number, partial_success in _protobuf_fields(content):
+                if number != 1 or not isinstance(partial_success, bytes):
+                    continue
+                for field, value in _protobuf_fields(partial_success):
+                    if field == 1 and isinstance(value, int):
+                        rejected_spans = value
+                    elif field == 2 and isinstance(value, bytes):
+                        error_message = value.decode("utf-8", errors="replace")
+    except Exception:
+        return 0, ""
+    return rejected_spans, error_message
 
 def install_export_watch(watch: ExportWatch = EXPORT_WATCH) -> bool:
     """Record the outcome of every span batch this process sends. False when requests is not there."""
@@ -5731,18 +5825,57 @@ def install_export_watch(watch: ExportWatch = EXPORT_WATCH) -> bool:
             raise
         if is_span_batch:
             status = getattr(response, "status_code", None)
-            watch.record(getattr(request, "body", None), status if isinstance(status, int) else None)
+            status = status if isinstance(status, int) else None
+            rejected_spans = 0
+            if status is not None and status < 400 and not kwargs.get("stream"):
+                rejected_spans, error_message = read_partial_success(getattr(response, "content", None))
+                if rejected_spans or error_message:
+                    info(f"Langfuse answered a batch of spans with a partial success: "
+                         f"rejected_spans={rejected_spans} error_message={error_message!r}")
+            watch.record(getattr(request, "body", None), status, rejected_spans)
         return response
 
     watched_send._langfuse_export_watch = watch  # type: ignore[attr-defined]
     requests.Session.send = watched_send  # type: ignore[method-assign]
     return True
 
+class PieceFlush:
+    """Sends the spans of a finished piece of a big send, one helper's run, before the next piece is read.
+
+    The SDK sends a batch as soon as EXPORT_BATCH_SPANS spans are queued, so a piece of
+    a few hundred spans goes out in several requests; the flush gives each piece a request
+    of its own at its end. It is off in a SessionEnd firing: Claude Code stops that hook
+    after 1.5 seconds in total, and the wait would use that time before the progress is
+    saved. A flush that does not finish in time ends the flushing between pieces; the flush
+    at the end of the firing tells what did not arrive."""
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.given_up = False
+
+    def after_piece(self, langfuse: Any) -> None:
+        if not self.enabled or self.given_up:
+            return
+
+        def _flush() -> None:
+            with contextlib.suppress(Exception):
+                langfuse.flush()
+
+        thread = threading.Thread(target=_flush, daemon=True)
+        thread.start()
+        thread.join(FLUSH_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            self.given_up = True
+            info(f"flush between helpers did not finish within {FLUSH_TIMEOUT_SECONDS:g} s; "
+                 f"the rest is sent at the end")
+
+PIECE_FLUSH = PieceFlush()
+
 def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> str:
     """Flush and shut down the client, waiting at most FLUSH_TIMEOUT_SECONDS.
 
     Returns DELIVERED, or LOST when the flush did not finish in time or a batch
-    failed on its last try, or REFUSED when Langfuse refused a batch."""
+    failed or had spans rejected on its last try, or REFUSED when Langfuse refused a batch."""
     if langfuse is None:
         return DELIVERED
 
@@ -5795,7 +5928,9 @@ def main() -> int:
         sweep_stale_context_files()
         sweep_saved_api_requests()
 
+    route_sdk_warnings_to_log()
     install_export_watch()
+    PIECE_FLUSH.enabled = not flush_deferred_agent_turns
     langfuse = create_langfuse_client(config)
     if langfuse is None:
         return 0

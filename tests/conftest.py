@@ -11,7 +11,7 @@ import shutil
 import sys
 import types
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import pytest
 
@@ -246,6 +246,16 @@ class FakeLangfuse:
     def __init__(self) -> None:
         self._otel_tracer = FakeTracer()
         self.observations: list[FakeObservation] = []
+        # What was started and ended when each flush was asked for, and what the flush does besides.
+        self.flushes: list[list[tuple[str, bool]]] = []
+        self.on_flush: Callable[[], None] = lambda: None
+
+    def flush(self) -> None:
+        self.flushes.append([(o.name, o.end_time is not None) for o in self.observations])
+        self.on_flush()
+
+    def shutdown(self) -> None:
+        pass
 
     @staticmethod
     def create_trace_id(*, seed: str | None = None) -> str:
@@ -279,6 +289,10 @@ def _reset_hook_logger(hook_module: Any) -> None:
         logger.removeHandler(handler)
         with contextlib.suppress(Exception):
             handler.close()
+    for name in ("opentelemetry", "langfuse"):
+        sdk_logger = logging.getLogger(name)
+        sdk_logger.handlers.clear()
+        sdk_logger.setLevel(logging.NOTSET)
 
 
 @pytest.fixture(autouse=True)
@@ -295,6 +309,8 @@ def _isolated_hook_env(tmp_path: Path, hook_module: Any, monkeypatch: pytest.Mon
     hook_module._AGENT_DEFINITION_CACHE.clear()
     hook_module.SENT_ROOT_CLAIMS.clear()
     hook_module.EXPORT_WATCH.last_try.clear()
+    hook_module.PIECE_FLUSH.enabled = False
+    hook_module.PIECE_FLUSH.given_up = False
     _reset_hook_logger(hook_module)
     yield state_dir
     _reset_hook_logger(hook_module)
