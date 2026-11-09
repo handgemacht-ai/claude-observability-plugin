@@ -115,9 +115,10 @@ def queued(at: float, text: str) -> dict[str, Any]:
             "content": text}
 
 
-def taken_from_queue(at: float, text: str) -> dict[str, Any]:
-    return {"type": "queue-operation", "operation": "remove", "timestamp": stamp(at), "sessionId": SESSION,
-            "content": text, "reason": "absorbed_mid_turn"}
+def taken_from_queue(at: float, text: str, reason: str | None = "absorbed_mid_turn") -> dict[str, Any]:
+    row = {"type": "queue-operation", "operation": "remove", "timestamp": stamp(at), "sessionId": SESSION,
+           "content": text}
+    return {**row, "reason": reason} if reason else row
 
 
 def attached_to_running_turn(uuid: str, at: float, text: str) -> dict[str, Any]:
@@ -159,6 +160,28 @@ def a_helper_result_attached_to_the_running_turn() -> list[dict[str, Any]]:
 
 def a_helper_hand_back() -> list[dict[str, Any]]:
     return a_turn_that_launched_a_helper() + [queued(10, notification_text()), hand_back("h1", 10)]
+
+
+def a_helper_notification_taken_from_the_queue(reason: str | None) -> list[dict[str, Any]]:
+    note = notification_text()
+    return a_turn_that_launched_a_helper() + [queued(10, note), taken_from_queue(11, note, reason)]
+
+
+SECOND_HELPER_TASK = "helper-2"
+SECOND_HELPER_CALL = "toolu_helper_2"
+
+
+def a_hand_back_of_the_first_of_two_helpers() -> list[dict[str, Any]]:
+    second_note = notification_text(SECOND_HELPER_TASK, SECOND_HELPER_CALL)
+    return [user("u1", 0, "Ask two helpers."),
+            assistant("a1", 1, [tool_use(HELPER_CALL, "Agent", description="Helper", prompt="Look."),
+                                tool_use(SECOND_HELPER_CALL, "Agent", description="Second", prompt="Dig.")]),
+            tool_result("r1", 2, HELPER_CALL, "Async agent launched successfully.",
+                        status="async_launched", isAsync=True),
+            tool_result("r1b", 2, SECOND_HELPER_CALL, "Async agent launched successfully.",
+                        status="async_launched", isAsync=True),
+            answer("a2", 3, "The helpers run."),
+            queued(10, notification_text()), hand_back("h1", 10), queued(12, second_note)]
 
 
 def answered(rows: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
