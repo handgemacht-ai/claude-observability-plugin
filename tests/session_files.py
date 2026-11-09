@@ -131,12 +131,12 @@ def delivered(uuid: str, at: float, text: str) -> dict[str, Any]:
     return user(uuid, at, text, origin={"kind": "task-notification"})
 
 
-def hand_back(uuid: str, at: float, task_id: str = HELPER_TASK) -> dict[str, Any]:
-    """The helper's final report, sent to the main session as a peer message."""
-    body = "[Subagent hand-back] Report."
+def hand_back(uuid: str, at: float, task_id: str = HELPER_TASK, note: str = "") -> dict[str, Any]:
+    """The helper's final report, sent to the main session as a peer message. Auto mode can put a note before it."""
+    body = note + "[Subagent hand-back] Report."
     return user(uuid, at, f'Another Claude session sent a message:\n<agent-message from="{task_id}">\n{body}\n'
                 "</agent-message>", isMeta=True,
-                origin={"kind": "peer", "from": task_id, "senderTaskId": task_id, "body": body})
+                origin={"kind": "peer", "from": task_id, "senderTaskId": task_id, "body": body, "handback": True})
 
 
 def a_turn_that_launched_a_helper() -> list[dict[str, Any]]:
@@ -160,6 +160,11 @@ def a_helper_result_attached_to_the_running_turn() -> list[dict[str, Any]]:
 
 def a_helper_hand_back() -> list[dict[str, Any]]:
     return a_turn_that_launched_a_helper() + [queued(10, notification_text()), hand_back("h1", 10)]
+
+
+def a_helper_hand_back_after_an_auto_mode_note() -> list[dict[str, Any]]:
+    note = "  Note: The server-side auto mode classifier was unavailable.\n\n"
+    return a_turn_that_launched_a_helper() + [queued(10, notification_text()), hand_back("h1", 10, note=note)]
 
 
 def a_helper_notification_taken_from_the_queue(reason: str | None) -> list[dict[str, Any]]:

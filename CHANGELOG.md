@@ -37,7 +37,7 @@ more of those steps.
 - **Newer forms of a helper's notification** (`get_undelivered_queued_notification_ids`, `notification_awaits_answer`). A turn that started a helper in the background is
   held until the helper's notification is delivered, because the answer to it belongs to the turn. The hold check knew a delivery only as a user row. Claude Code
   2.1.31x also writes it as an attachment to the running turn, as a queue `remove` row that names its reason (`absorbed_mid_turn`, `delivered_to_agent`) and
-  as the helper's hand-back (a peer message that starts with `[Subagent hand-back]`). All of them count as delivered now. The result of a helper's own background
+  as the helper's hand-back (a peer message whose origin has `handback: true` or whose text starts with `[Subagent hand-back]`; auto mode can put a note before that text). All of them count as delivered now. The result of a helper's own background
   task, which the main log only queues and removes, no longer holds the main turn. A notification that arrives again after its helper handed back and the hand-back
   was answered no longer waits for an answer it never gets. A hand-back or an attached notification after the last answer still holds the turn until the agent has answered.
   Attachment rows only feed the hold check, so tool results and end times stay as they were.
@@ -96,7 +96,7 @@ more of those steps.
   recommended until the gate shows how many records still wait.
 - A project folder that is itself named `*.superseded-*` is not excluded; none exists in the data.
 - A remove row counts as delivered only when it names a reason. Rows without one (older Claude Code) still hold the turn, the safe direction. Upstream (langfuse/Claude-Observability-Plugin) PR 113 counts every remove row; this is a choice.
-- A hand-back is recognised by a peer message whose text starts with `[Subagent hand-back]`. If that text changes, turns are held again and the old bug is back.
+- A hand-back is recognised by a peer message whose origin has `handback: true` (all 2,541 hand-backs in the logs) or whose text starts with `[Subagent hand-back]`. If both change, turns are held again and the old bug is back.
 - A turn is still held in the short gap between a notification's enqueue and its remove row; in the examples the remove row came within seconds.
 - Not checked: 132 repeat notifications after a hand-back that were followed by an assistant row. It is open whether any of them was a real answer after the final answer; the named examples were never answered.
   Worth checking against the gate's waiting records. Upstream's mapping of background-task ids to their tool calls is not part of this change.
