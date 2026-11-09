@@ -2432,13 +2432,47 @@ def get_agent_resumes_from_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, An
             })
     return resumes
 
+HAND_BACK_TOOL = "SubagentHandback"
+
+def get_agent_wakes_from_rows(agent_id: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Task notifications of an agent's own background tasks that woke it
+    after it stopped: its last answer called no tool other than the hand-back.
+
+    The woken agent goes on in its own transcript as after a SendMessage
+    resume, so each wake starts a run. No tool call names the run; its key is
+    the agent id and the time of the notification.
+    """
+    if not isinstance(agent_id, str) or not agent_id:
+        return []
+    wakes: List[Dict[str, Any]] = []
+    stopped = False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        role = get_user_or_assistant_role_from_row(row)
+        if role == "assistant":
+            tool_names = {block.get("name") for block in get_tool_use_blocks(get_content_from_row(row))}
+            stopped = tool_names <= {HAND_BACK_TOOL}
+            continue
+        if role != "user" or is_tool_result(row):
+            continue
+        timestamp = parse_timestamp(row)
+        if stopped and is_task_notification_row(row) and timestamp is not None:
+            wakes.append({
+                "tool_use_id": f"{agent_id}@{row.get('timestamp')}",
+                "agent_id": agent_id,
+                "timestamp": _as_aware(timestamp),
+            })
+        stopped = False
+    return wakes
+
 def register_agent_resumes(
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
     resumes: List[Dict[str, Any]],
 ) -> None:
     """Add an entry per resumed run, keyed by its SendMessage tool_use id, so
     the run nests under that tool span the way a launch nests under its
-    Agent span.
+    Agent span. A woken run is keyed by its wake, see get_agent_wakes_from_rows.
 
     The launch entry and all run entries of one agent share a single sorted
     resume_starts list; select_agent_run_rows cuts the transcript there.
@@ -2487,7 +2521,8 @@ def is_prompt_row(row: Dict[str, Any]) -> bool:
 
 def find_resumed_run_start(rows: List[Dict[str, Any]], resume_start: datetime, search_from: int) -> int:
     """Index of the row that opens a resumed run: the coordinator's message
-    written after the SendMessage call, else the first prompt row after it.
+    written after the SendMessage call, else the first prompt row after it;
+    for a woken agent the task notification written at resume_start.
     len(rows) when the run has not started (yet)."""
     fallback: Optional[int] = None
     for index in range(search_from, len(rows)):
@@ -2496,6 +2531,8 @@ def find_resumed_run_start(rows: List[Dict[str, Any]], resume_start: datetime, s
         if timestamp is None or _as_aware(timestamp) < resume_start:
             continue
         if is_coordinator_message_row(row):
+            return index
+        if _as_aware(timestamp) == resume_start and is_task_notification_row(row):
             return index
         if fallback is None and is_prompt_row(row):
             fallback = index
@@ -2524,12 +2561,19 @@ def promote_opening_meta_prompt(run_rows: List[Dict[str, Any]]) -> List[Dict[str
 
     The coordinator's message that resumes a stopped agent, and the skill text a
     forked skill agent starts with, are isMeta rows: no human typed them, and
-    the run has no other prompt row to start its turn at.
+    the run has no other prompt row to start its turn at. The task notification
+    that wakes a stopped agent is one too, and is a prompt once it loses the
+    origin that marks it as a notification.
     """
-    if not run_rows or not is_prompt_row(run_rows[0]) or not run_rows[0].get("isMeta"):
+    if not run_rows or not run_rows[0].get("isMeta"):
+        return run_rows
+    woken = is_task_notification_row(run_rows[0])
+    if not woken and not is_prompt_row(run_rows[0]):
         return run_rows
     promoted = dict(run_rows[0])
     promoted.pop("isMeta", None)
+    if woken:
+        promoted.pop("origin", None)
     return [promoted] + run_rows[1:]
 
 
@@ -4198,6 +4242,65 @@ def emit_generation_observation(
         **generation_kwargs,
     )
 
+def get_woken_run_stopped_at(
+    launch: Dict[str, Any],
+    stopped_at: datetime,
+    subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """The run of the launched agent that stopped at stopped_at, when its own
+    background task woke it; None for its launch and SendMessage runs."""
+    wakes = get_agent_wakes_from_rows(launch.get("agent_id"), read_subagent_jsonl(launch["path"]) or [])
+    register_agent_resumes(subagent_transcripts_by_tool_use_id, wakes)
+    for wake in reversed(wakes):
+        run = subagent_transcripts_by_tool_use_id.get(wake["tool_use_id"])
+        if wake["timestamp"] >= stopped_at or not isinstance(run, dict):
+            continue
+        later_starts = [s for s in run.get("resume_starts") or [] if wake["timestamp"] < s < stopped_at]
+        return None if later_starts else run
+    return None
+
+def emit_woken_agent_runs(
+    langfuse: Langfuse,
+    parent_otel_span: Any,
+    turn: Turn,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
+    cursor: EmissionCursor,
+    nesting: Optional["AgentNesting"] = None,
+) -> Optional[datetime]:
+    """Emit the runs of agents that their own background tasks woke.
+
+    Claude Code queues an agent's task notification in this transcript each
+    time the agent stops. The queued row of a stop after a wake shows that the
+    woken run is complete, and it sits in one turn only: that turn emits the run.
+    """
+    if not subagent_transcripts_by_tool_use_id:
+        return None
+    task_id_to_tool_use_id = get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id)
+    latest_end_timestamp: Optional[datetime] = None
+    for row in turn.rows:
+        if row.get("type") != "queue-operation" or row.get("operation") != "enqueue":
+            continue
+        if not is_task_notification_row(row):
+            continue
+        launch_tool_use_id = task_id_to_tool_use_id.get(get_task_id_from_task_notification(row) or "")
+        launch = subagent_transcripts_by_tool_use_id.get(launch_tool_use_id) if launch_tool_use_id else None
+        stopped_at = parse_timestamp(row)
+        if not isinstance(launch, dict) or not isinstance(launch.get("path"), Path) or stopped_at is None:
+            continue
+        run = get_woken_run_stopped_at(launch, _as_aware(stopped_at), subagent_transcripts_by_tool_use_id)
+        if run is None or not cursor.should_emit(f"subagent:{run['tool_use_id']}"):
+            continue
+        run_end_timestamp = emit_subagent_observations(
+            langfuse,
+            parent_otel_span,
+            run,
+            None,
+            nesting=nesting,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+        )
+        latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, run_end_timestamp)
+    return latest_end_timestamp
+
 def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn,
                            start_timestamp: Optional[datetime],
                            generation_name: str = "LLM Call",
@@ -4218,8 +4321,9 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
     of this turn. Callers pass None when the history is not available,
     and the inputs then keep the delta form.
 
-    Agent launches expand recursively under their tool spans; nesting says
-    where this turn sits in the agent tree (None: the main conversation).
+    Agent launches expand recursively under their tool spans, and runs that an
+    agent's own background task woke under this span; nesting says where this
+    turn sits in the agent tree (None: the main conversation).
     """
     cursor = cursor if cursor is not None else fresh_cursor()
     user_text, _ = truncate_text(extract_text_from_content(get_content_from_row(turn.user_msg)))
@@ -4356,7 +4460,12 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
         elif assistant_timestamp is not None:
             previous_timestamp = assistant_timestamp
 
-    return latest_end_timestamp
+    return _get_latest_timestamp(
+        latest_end_timestamp,
+        emit_woken_agent_runs(
+            langfuse, parent_otel_span, turn, subagent_transcripts_by_tool_use_id, cursor, nesting
+        ),
+    )
 
 def emit_workflow_agent_observations(
     langfuse: Langfuse,
@@ -4449,6 +4558,11 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     if all_rows is None:
         return start_timestamp
 
+    # The runs this agent's own background tasks woke, registered before the
+    # cut so this run ends where the next one starts.
+    register_agent_resumes(
+        subagent_transcripts_by_tool_use_id, get_agent_wakes_from_rows(subagent.get("agent_id"), all_rows)
+    )
     rows, run_index, run_end = select_agent_run_rows(subagent, all_rows)
     # This agent's own SendMessage resumes of its children, registered before
     # its launches are emitted so each launch is cut at its first resume.
