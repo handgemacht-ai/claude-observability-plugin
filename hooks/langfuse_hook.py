@@ -4329,7 +4329,11 @@ def get_woken_run_stopped_at(
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
     """The run of the launched agent that stopped at stopped_at, when its own
-    background task woke it; None for its launch and SendMessage runs."""
+    background task woke it; None for its launch and SendMessage runs.
+
+    Only the first queued stop after the wake gets the run: each turn keeps its
+    own emitted keys, and a later stop that no known run start precedes (a
+    resume the plugin does not see) would send the run again."""
     wakes = get_run_starting_wakes(launch, read_subagent_jsonl(launch["path"]) or [])
     register_agent_resumes(subagent_transcripts_by_tool_use_id, wakes)
     for wake in reversed(wakes):
@@ -4337,7 +4341,8 @@ def get_woken_run_stopped_at(
         if wake["timestamp"] >= stopped_at or not isinstance(run, dict):
             continue
         later_starts = [s for s in run.get("resume_starts") or [] if wake["timestamp"] < s < stopped_at]
-        return None if later_starts else run
+        first_stop = min((stop for stop in launch.get("notified_stops") or [] if stop > wake["timestamp"]), default=None)
+        return None if later_starts or first_stop != stopped_at else run
     return None
 
 def emit_woken_agent_runs(

@@ -46,8 +46,9 @@ more of those steps.
   (its last answer had no tool call, or only `SubagentHandback`). For a helper the main agent launched, the first wake after a stop that Claude Code queued a notification for in the
   main log now starts a later run, `Subagent: … (resumed #n)` like a run that `SendMessage` resumes, and the earlier run ends at that wake. Claude Code does not queue every stop (helper
   a2fe5255 of 6f4d9428 woke 6 times and has one queued notification), so a wake after a stop that was not queued stays in the run before it, which is sent whole at the queued stop.
-  The main turn that holds the queued notification of the helper's next stop sends the later run under its own span: the span of the launching call was sent and closed with the first
-  run. Helpers of helpers are not cut and are sent whole with their parent, as in release 10.
+  The main turn that holds the first queued notification after the wake sends the later run, once, under its own span: the span of the launching call was sent and closed with the first
+  run. A later queued notification that no new run start precedes (a resume the plugin does not see, such as a peer message or a `SendMessage` result without `resumedAgentId` before Claude
+  Code 2.1.197) does not send it again. Helpers of helpers are not cut and are sent whole with their parent, as in release 10.
 - **Rejected spans, smaller requests, the SDK's warnings** (`ExportWatch`, `EXPORT_BATCH_SPANS`, `PieceFlush`, `SdkLogRelay`). A batch that Langfuse took with spans rejected
   (`partial_success.rejected_spans` in the OTLP answer, read from protobuf or JSON by hand, no new dependency) counts as `lost`, so the firing is undone and sent again like any lost
   one; the log gets `rejected_spans` and `error_message`. The warnings and errors of the `opentelemetry` and `langfuse` loggers, such as a batch dropped above the request size limit,

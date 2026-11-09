@@ -57,9 +57,9 @@ Everything else works as described in the [README](./README.md).
     `Subagent: … (resumed #n)` like a run that `SendMessage` resumes, when
     Claude Code queued a notification of that stop in the main log. The run
     before it ends at the wake and is not sent again. The main turn that holds
-    the queued notification of the helper's next stop sends the later run under
-    its own span: the span of the launching call was sent and closed with the
-    first run. Claude Code does not queue every stop, so a wake after a stop
+    the first queued notification after the wake sends the later run, once,
+    under its own span: the span of the launching call was sent and closed with
+    the first run. Claude Code does not queue every stop, so a wake after a stop
     that was not queued stays in the run before it, which is sent whole at the
     queued stop. A stop at the `SubagentHandback` call counts as a stop.
     Helpers of helpers are not cut this way and stay as before.

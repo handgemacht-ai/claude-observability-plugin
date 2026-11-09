@@ -273,6 +273,28 @@ def answered_at_the_helper_later_stop(rows: list[dict[str, Any]], at: float = 30
                    answer("a4", at + 1, "The helper is done.")]
 
 
+HELPER_PEER_CALL = "toolu_helper_read_3"
+
+
+def woken_by_a_peer_message(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A message of another agent wakes the helper; no SendMessage call in the main transcript names it."""
+    return rows + [user("h-peer", 60, "Another Claude session sent a message.", isMeta=True,
+                        origin={"kind": "peer", "from": "helper-9", "senderTaskId": "helper-9", "body": "Check b."}),
+                   assistant("h-a9", 61, [tool_use(HELPER_PEER_CALL, "Read", file_path="b.txt")]),
+                   tool_result("h-r5", 62, HELPER_PEER_CALL, "B."),
+                   answer("h-a10", 65, "B is fine.")]
+
+
+def a_later_turn(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return rows + [user("u2", 50, "Anything new?"), answer("b1", 51, "Still waiting.")]
+
+
+def answered_at_the_helper_next_stop(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return rows + [queued(66, notification_of_a_later_stop()),
+                   delivered("n3", 66.1, notification_of_a_later_stop()),
+                   answer("b2", 67, "The helper checked b.")]
+
+
 INNER_TASK = "inner"
 INNER_BACKGROUND_CALL = "toolu_inner_bash"
 INNER_LATER_CALL = "toolu_inner_read"

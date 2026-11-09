@@ -12,6 +12,7 @@ from tests.woken_helpers import (
     FIRST_RUN,
     INNER_RUN,
     LATER_RUN,
+    a_peer_message_wakes_the_helper_and_its_next_stop_lands_in_the_later_turn,
     a_session_whose_helper_of_a_helper_its_own_background_task_wakes,
     a_session_whose_helper_waits_on_its_own_background_task,
     expect_helper_runs,
@@ -19,6 +20,7 @@ from tests.woken_helpers import (
     expect_step_sent_once,
     expect_steps_sent_once,
     sent_at_the_helper_first_stop,
+    sent_until_a_later_turn_closed_the_launching_one,
     the_helper_wakes_and_stops_again,
     the_helper_wakes_and_works,
     the_helper_wakes_twice_and_only_its_last_stop_is_reported,
@@ -97,3 +99,17 @@ def test_a_woken_helper_of_a_helper_whose_stop_the_main_transcript_queued_stays_
 
     expect_step_sent_once(fake_langfuse, INNER_LATER_CALL)
     expect_helper_runs(fake_langfuse, [FIRST_RUN, INNER_RUN])
+
+
+def test_a_woken_run_sent_in_one_turn_is_not_sent_again_by_a_later_stop_of_the_helper_in_another_turn(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path
+):
+    session = a_session_whose_helper_waits_on_its_own_background_task(tmp_path)
+    the_helper_wakes_and_stops_again(session)
+    sent_until_a_later_turn_closed_the_launching_one(hook_module, fake_langfuse, session)
+    a_peer_message_wakes_the_helper_and_its_next_stop_lands_in_the_later_turn(session)
+
+    fire(hook_module, fake_langfuse, session)
+
+    expect_step_sent_once(fake_langfuse, HELPER_LATER_CALL)
+    expect_helper_runs(fake_langfuse, [FIRST_RUN, LATER_RUN])
