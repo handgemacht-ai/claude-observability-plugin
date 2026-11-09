@@ -1139,12 +1139,14 @@ def is_task_notification_attachment_row(row: Dict[str, Any]) -> bool:
 
 def get_hand_back_task_id(row: Dict[str, Any]) -> Optional[str]:
     """Task id of the helper whose final report this user row hands back as a
-    peer message; the helper's task notification is queued with it."""
+    peer message; the helper's task notification is queued with it. Auto mode
+    can put a note before the report's marker, but not before the flag."""
     origin = row.get("origin")
     if get_user_or_assistant_role_from_row(row) != "user" or not isinstance(origin, dict):
         return None
     body = origin.get("body")
-    if origin.get("kind") != "peer" or not isinstance(body, str) or not body.startswith("[Subagent hand-back]"):
+    marked = isinstance(body, str) and body.startswith("[Subagent hand-back]")
+    if origin.get("kind") != "peer" or not (origin.get("handback") is True or marked):
         return None
     task_id = origin.get("senderTaskId")
     return task_id if isinstance(task_id, str) and task_id else None

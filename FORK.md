@@ -44,7 +44,8 @@ Everything else works as described in the [README](./README.md).
   when the log shows it in one of the forms that Claude Code 2.1.31x writes: a
   user row, an attachment to the running turn, a queue `remove` row that names
   its reason (`absorbed_mid_turn` or `delivered_to_agent`), or the helper's
-  hand-back, a peer message that starts with `[Subagent hand-back]`. A `remove`
+  hand-back, a peer message whose origin has `handback: true` or that starts
+  with `[Subagent hand-back]`. A `remove`
   row without a reason keeps the turn waiting until the turn ends. A hand-back or
   an attached notification after the last answer of the turn holds it until the
   agent has answered; a notification that arrives again after its helper handed

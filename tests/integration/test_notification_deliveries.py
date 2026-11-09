@@ -5,6 +5,7 @@ from tests.session_files import (
     a_finished_turn_while_a_helper_takes_its_own_background_task_result,
     a_hand_back_of_the_first_of_two_helpers,
     a_helper_hand_back,
+    a_helper_hand_back_after_an_auto_mode_note,
     a_helper_notification_taken_from_the_queue,
     a_helper_result_attached_to_the_running_turn,
     a_resumed_helper_that_did_not_hand_back_again,
@@ -38,6 +39,16 @@ def test_a_helper_hand_back_delivers_the_queued_notification_of_the_helper(
     hook_module, fake_langfuse, isolated_hook_state, tmp_path
 ):
     session = a_session_with(tmp_path, answered(a_helper_hand_back(), "The helper found it."))
+
+    fire(hook_module, fake_langfuse, session)
+
+    expect_turn_sent_with(fake_langfuse, "The helper found it.")
+
+
+def test_a_helper_hand_back_after_an_auto_mode_note_delivers_the_queued_notification_of_the_helper(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path
+):
+    session = a_session_with(tmp_path, answered(a_helper_hand_back_after_an_auto_mode_note(), "The helper found it."))
 
     fire(hook_module, fake_langfuse, session)
 
