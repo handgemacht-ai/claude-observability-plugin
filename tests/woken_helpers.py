@@ -8,17 +8,27 @@ from tests.held_turns import fire
 from tests.session_files import (
     HELPER_META,
     HELPER_TASK,
+    INNER_META,
+    INNER_TASK,
     SessionDir,
+    a_helper_of_a_helper_that_its_own_background_task_wakes,
+    a_helper_that_waits_on_a_helper_of_its_own,
     a_helper_that_waits_on_its_own_background_task,
     a_main_turn_answered_at_the_helper_first_stop,
+    a_main_turn_that_waited_for_a_helper,
     a_session_with,
     answered_at_the_helper_later_stop,
+    notification_of_a_later_stop,
+    queued,
     stopped_again,
+    waiting_on_a_second_background_task,
     woken_by_its_background_task,
+    woken_by_its_second_background_task,
 )
 
 FIRST_RUN = "Subagent: explorer · Look up"
 LATER_RUN = "Subagent: explorer · Look up (resumed #1)"
+INNER_RUN = "Subagent: explorer · Dig"
 
 
 def a_session_whose_helper_waits_on_its_own_background_task(tmp_path: Path) -> SessionDir:
@@ -45,6 +55,27 @@ def the_helper_wakes_and_stops_again(session: SessionDir) -> None:
     session.write_main(answered_at_the_helper_later_stop(a_main_turn_answered_at_the_helper_first_stop()))
 
 
+def the_helper_wakes_twice_and_only_its_last_stop_is_reported(session: SessionDir) -> None:
+    """Claude Code queues no notification in the main transcript for the stop between the two wakes."""
+    session.add_agent(
+        HELPER_TASK,
+        woken_by_its_second_background_task(waiting_on_a_second_background_task(
+            woken_by_its_background_task(a_helper_that_waits_on_its_own_background_task()))),
+        HELPER_META,
+    )
+    session.write_main(answered_at_the_helper_later_stop(a_main_turn_answered_at_the_helper_first_stop(), at=50))
+
+
+def a_session_whose_helper_of_a_helper_its_own_background_task_wakes(
+    tmp_path: Path, stop_queued_in_the_main_transcript: bool = False
+) -> SessionDir:
+    during = [queued(26, notification_of_a_later_stop(INNER_TASK))] if stop_queued_in_the_main_transcript else []
+    session = a_session_with(tmp_path, a_main_turn_that_waited_for_a_helper(during))
+    session.add_agent(HELPER_TASK, a_helper_that_waits_on_a_helper_of_its_own(), HELPER_META)
+    session.add_agent(INNER_TASK, a_helper_of_a_helper_that_its_own_background_task_wakes(), INNER_META)
+    return session
+
+
 def tool_spans_of(fake_langfuse: Any, tool_use_id: str) -> list[Any]:
     return [o for o in fake_langfuse.observations
             if o.as_type == "tool" and o.kwargs["metadata"].get("tool_id") == tool_use_id]
@@ -60,3 +91,8 @@ def expect_step_not_sent(fake_langfuse: Any, tool_use_id: str) -> None:
 
 def expect_helper_runs(fake_langfuse: Any, names: list[str]) -> None:
     assert [o.name for o in fake_langfuse.observations if o.name.startswith("Subagent:")] == names
+
+
+def expect_steps_sent_once(fake_langfuse: Any, tool_use_ids: list[str]) -> None:
+    assert {tool_use_id: len(tool_spans_of(fake_langfuse, tool_use_id)) for tool_use_id in tool_use_ids} == {
+        tool_use_id: 1 for tool_use_id in tool_use_ids}

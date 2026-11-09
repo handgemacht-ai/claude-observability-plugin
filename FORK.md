@@ -52,15 +52,17 @@ Everything else works as described in the [README](./README.md).
   back and the hand-back was answered gets no answer and holds nothing. The
   result of a helper's own background task, which the main log only queues and
   removes, does not hold the main turn.
-  - A helper that its own background task wakes after it stopped writes the
-    rows after the wake as a later run, `Subagent: … (resumed #n)` like a run
-    that `SendMessage` resumes. The run before it ends at the wake and is not
-    sent again. The main turn that holds the queued notification of the helper's
-    next stop sends the later run, once, under its own span: the span of the
-    launching call was sent and closed with the first run. A stop at the
-    `SubagentHandback` call counts as a stop. Only the rows that follow a wake
-    in the helper's own log are cut this way; helpers of helpers that their own
-    tasks wake have no such rows in their parent's log and stay as before.
+  - A helper that the main agent launched and that its own background task
+    wakes after it stopped writes the rows after the wake as a later run,
+    `Subagent: … (resumed #n)` like a run that `SendMessage` resumes, when
+    Claude Code queued a notification of that stop in the main log. The run
+    before it ends at the wake and is not sent again. The main turn that holds
+    the queued notification of the helper's next stop sends the later run under
+    its own span: the span of the launching call was sent and closed with the
+    first run. Claude Code does not queue every stop, so a wake after a stop
+    that was not queued stays in the run before it, which is sent whole at the
+    queued stop. A stop at the `SubagentHandback` call counts as a stop.
+    Helpers of helpers are not cut this way and stay as before.
 - **Agent names**: the main agent (`--agent` or the `agent` setting) and each
   subagent type show up in observation names, the trace name, tags and metadata.
 - **One trace per request**: a message continues the current trace when the

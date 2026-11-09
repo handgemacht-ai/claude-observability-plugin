@@ -242,16 +242,71 @@ def stopped_again(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows + [answer("h-a4", 25, "The test run passed.")]
 
 
+HELPER_SECOND_BACKGROUND_CALL = "toolu_helper_bash_2"
+HELPER_LAST_CALL = "toolu_helper_read_2"
+
+
+def waiting_on_a_second_background_task(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return rows + [assistant("h-a5", 23, [tool_use(HELPER_SECOND_BACKGROUND_CALL, "Bash", command="make lint",
+                                                   run_in_background=True)]),
+                   tool_result("h-r3", 24, HELPER_SECOND_BACKGROUND_CALL, "Running in the background."),
+                   answer("h-a6", 25, "Waiting for the lint run.")]
+
+
+def woken_by_its_second_background_task(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    note = "Background task event.\n" + notification_text("bash-2", HELPER_SECOND_BACKGROUND_CALL)
+    return rows + [user("h-wake-2", 40, note, isMeta=True, origin={"kind": "task-notification"}),
+                   assistant("h-a7", 41, [tool_use(HELPER_LAST_CALL, "Read", file_path="lint.txt")]),
+                   tool_result("h-r4", 42, HELPER_LAST_CALL, "Clean."),
+                   answer("h-a8", 45, "Tests and lint pass.")]
+
+
 def a_main_turn_answered_at_the_helper_first_stop() -> list[dict[str, Any]]:
     return a_turn_that_launched_a_helper() + [queued(10, notification_text()),
                                               delivered("n1", 10.1, notification_text()),
                                               answer("a3", 11, "The helper waits on its test run.")]
 
 
-def answered_at_the_helper_later_stop(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return rows + [queued(30, notification_of_a_later_stop()),
-                   delivered("n2", 30.1, notification_of_a_later_stop()),
-                   answer("a4", 31, "The helper is done.")]
+def answered_at_the_helper_later_stop(rows: list[dict[str, Any]], at: float = 30) -> list[dict[str, Any]]:
+    return rows + [queued(at, notification_of_a_later_stop()),
+                   delivered("n2", at + 0.1, notification_of_a_later_stop()),
+                   answer("a4", at + 1, "The helper is done.")]
+
+
+INNER_TASK = "inner"
+INNER_BACKGROUND_CALL = "toolu_inner_bash"
+INNER_LATER_CALL = "toolu_inner_read"
+INNER_META = {"agentType": "explorer", "description": "Dig", "spawnDepth": 2, "parentAgentId": HELPER_TASK}
+
+
+def a_helper_that_waits_on_a_helper_of_its_own() -> list[dict[str, Any]]:
+    return [user("o-prompt", 2, "Look it up."),
+            assistant("o-call", 3, [tool_use("toolu_inner", "Agent", description="Dig", subagent_type="explorer",
+                                             run_in_background=True)]),
+            tool_result("o-result", 3.5, "toolu_inner", "Async agent launched successfully.", agentId=INNER_TASK,
+                        status="async_launched", isAsync=True),
+            delivered("o-note", 26, notification_of_a_later_stop(INNER_TASK)),
+            answer("o-answer", 27, "Found it.")]
+
+
+def a_helper_of_a_helper_that_its_own_background_task_wakes() -> list[dict[str, Any]]:
+    note = "Background task event.\n" + notification_text("bash-9", INNER_BACKGROUND_CALL)
+    return [user("i-prompt", 4, "Dig."),
+            assistant("i-a1", 5, [tool_use(INNER_BACKGROUND_CALL, "Bash", command="make test", run_in_background=True)]),
+            tool_result("i-r1", 6, INNER_BACKGROUND_CALL, "Running in the background."),
+            answer("i-a2", 9, "Waiting for the test run."),
+            user("i-wake", 20, note, isMeta=True, origin={"kind": "task-notification"}),
+            assistant("i-a3", 21, [tool_use(INNER_LATER_CALL, "Read", file_path="report.txt")]),
+            tool_result("i-r2", 22, INNER_LATER_CALL, "All passed."),
+            answer("i-a4", 25, "The test run passed.")]
+
+
+def a_main_turn_that_waited_for_a_helper(during: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    return [user("u1", 0, "Ask a helper."),
+            assistant("a1", 1, [tool_use(HELPER_CALL, "Agent", description="Look up", subagent_type="explorer")]),
+            *(during or []),
+            tool_result("r1", 30, HELPER_CALL, "Found it.", agentId=HELPER_TASK),
+            answer("a2", 31, "Done.")]
 
 
 FORKED = {"agentType": "general-purpose", "isBuiltIn": True, "spawnDepth": 2}

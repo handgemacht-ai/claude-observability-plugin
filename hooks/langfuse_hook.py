@@ -2519,6 +2519,34 @@ def get_agent_wakes_from_rows(agent_id: Any, rows: List[Dict[str, Any]]) -> List
         stopped = False
     return wakes
 
+def get_notified_stops_by_task_id(rows: List[Dict[str, Any]]) -> Dict[str, List[datetime]]:
+    """When Claude Code queued a task notification in the main transcript, by task id."""
+    notified_stops: Dict[str, List[datetime]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("type") != "queue-operation" or row.get("operation") != "enqueue":
+            continue
+        task_id = get_task_id_from_task_notification(row) if is_task_notification_row(row) else None
+        timestamp = parse_timestamp(row)
+        if task_id and timestamp is not None:
+            notified_stops.setdefault(task_id, []).append(_as_aware(timestamp))
+    return notified_stops
+
+def get_run_starting_wakes(subagent: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The wakes that start a later run: the first wake after each stop of the
+    agent that the main transcript queued a notification for.
+
+    Claude Code does not queue one at every stop, and only a queued stop sends
+    a woken run, so a wake after a stop that was not queued stays in the run
+    before it. A helper of a helper has no queued stops listed and is not cut."""
+    notified_stops = subagent.get("notified_stops") or []
+    run_starts: List[Dict[str, Any]] = []
+    previous_wake: Optional[datetime] = None
+    for wake in get_agent_wakes_from_rows(subagent.get("agent_id"), rows):
+        if any((previous_wake is None or previous_wake < stop) and stop < wake["timestamp"] for stop in notified_stops):
+            run_starts.append(wake)
+        previous_wake = wake["timestamp"]
+    return run_starts
+
 def register_agent_resumes(
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
     resumes: List[Dict[str, Any]],
@@ -4302,7 +4330,7 @@ def get_woken_run_stopped_at(
 ) -> Optional[Dict[str, Any]]:
     """The run of the launched agent that stopped at stopped_at, when its own
     background task woke it; None for its launch and SendMessage runs."""
-    wakes = get_agent_wakes_from_rows(launch.get("agent_id"), read_subagent_jsonl(launch["path"]) or [])
+    wakes = get_run_starting_wakes(launch, read_subagent_jsonl(launch["path"]) or [])
     register_agent_resumes(subagent_transcripts_by_tool_use_id, wakes)
     for wake in reversed(wakes):
         run = subagent_transcripts_by_tool_use_id.get(wake["tool_use_id"])
@@ -4322,9 +4350,10 @@ def emit_woken_agent_runs(
 ) -> Optional[datetime]:
     """Emit the runs of agents that their own background tasks woke.
 
-    Claude Code queues an agent's task notification in this transcript each
-    time the agent stops. The queued row of a stop after a wake shows that the
-    woken run is complete, and it sits in one turn only: that turn emits the run.
+    Claude Code queues an agent's task notification in this transcript when
+    the agent stops, though not at every stop. The queued row of a stop after a
+    run start shows that the woken run is complete, and it sits in one turn
+    only: that turn emits the run.
     """
     if not subagent_transcripts_by_tool_use_id:
         return None
@@ -4613,9 +4642,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
 
     # The runs this agent's own background tasks woke, registered before the
     # cut so this run ends where the next one starts.
-    register_agent_resumes(
-        subagent_transcripts_by_tool_use_id, get_agent_wakes_from_rows(subagent.get("agent_id"), all_rows)
-    )
+    register_agent_resumes(subagent_transcripts_by_tool_use_id, get_run_starting_wakes(subagent, all_rows))
     rows, run_index, run_end = select_agent_run_rows(subagent, all_rows)
     # This agent's own SendMessage resumes of its children, registered before
     # its launches are emitted so each launch is cut at its first resume.
@@ -5649,8 +5676,11 @@ def emit_new_turns_from_transcript(
                 session_id, full_rows, session_state, payload_agent_type
             )
             visible_until = firing_snapshot_time()
+            notified_stops = get_notified_stops_by_task_id(full_rows or [])
             for subagent in subagent_transcripts_by_tool_use_id.values():
                 subagent["visible_until"] = visible_until
+                if not subagent.get("parent_agent_id"):
+                    subagent["notified_stops"] = notified_stops.get(subagent.get("agent_id"), [])
             register_agent_resumes(
                 subagent_transcripts_by_tool_use_id, session_context.index.resumes
             )
