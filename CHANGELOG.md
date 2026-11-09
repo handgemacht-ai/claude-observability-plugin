@@ -43,9 +43,11 @@ more of those steps.
   Attachment rows only feed the hold check, so tool results and end times stay as they were.
 - **Helpers that their own background task wakes** (`get_agent_wakes_from_rows`, `emit_woken_agent_runs`). A helper was sent once, at its first stop. When a background task of its own
   woke it afterwards, the rows it wrote after the wake formed no run and no later firing sent them. A wake is the helper's own task notification as a user row after the helper stopped
-  (its last answer had no tool call, or only `SubagentHandback`). Each wake now starts a later run, `Subagent: … (resumed #n)` like a run that `SendMessage` resumes, and the earlier
-  run ends at the wake. The main turn that holds the queued notification of the helper's next stop sends the later run, once, under its own span: the span of the launching call was
-  sent and closed with the first run.
+  (its last answer had no tool call, or only `SubagentHandback`). For a helper the main agent launched, the first wake after a stop that Claude Code queued a notification for in the
+  main log now starts a later run, `Subagent: … (resumed #n)` like a run that `SendMessage` resumes, and the earlier run ends at that wake. Claude Code does not queue every stop (helper
+  a2fe5255 of 6f4d9428 woke 6 times and has one queued notification), so a wake after a stop that was not queued stays in the run before it, which is sent whole at the queued stop.
+  The main turn that holds the queued notification of the helper's next stop sends the later run under its own span: the span of the launching call was sent and closed with the first
+  run. Helpers of helpers are not cut and are sent whole with their parent, as in release 10.
 - **Rejected spans, smaller requests, the SDK's warnings** (`ExportWatch`, `EXPORT_BATCH_SPANS`, `PieceFlush`, `SdkLogRelay`). A batch that Langfuse took with spans rejected
   (`partial_success.rejected_spans` in the OTLP answer, read from protobuf or JSON by hand, no new dependency) counts as `lost`, so the firing is undone and sent again like any lost
   one; the log gets `rejected_spans` and `error_message`. The warnings and errors of the `opentelemetry` and `langfuse` loggers, such as a batch dropped above the request size limit,
@@ -101,7 +103,7 @@ more of those steps.
 - Not checked: 132 repeat notifications after a hand-back that were followed by an assistant row. It is open whether any of them was a real answer after the final answer; the named examples were never answered.
   Worth checking against the gate's waiting records. Upstream's mapping of background-task ids to their tool calls is not part of this change.
 - A helper woken after its `SubagentHandback` call counts as woken. The change relies on the queued-notification rows that Claude Code 2.1.31x writes in the main log, and does not cover helpers of helpers that
-  their own tasks wake (the log of their parent has no such rows) nor a wake row whose text starts directly with `<task-notification>`. A woken run sits under the span of the main turn that holds the
+  their own tasks wake (they are sent whole with their parent, so rows they write after that are still missing, as in release 10) nor a wake row whose text starts directly with `<task-notification>`. A woken run sits under the span of the main turn that holds the
   helper's next stop, not under the original `Agent` call. Each firing reads again the log of each helper that has a queued notification in the open turn, a small extra cost.
 - A batch that the exporter drops above its request size limit makes no request, so the watch cannot see it: with the real SDK it still counts as `delivered` and the state is saved. It shows only as a
   warning in the hook log. Counting that warning as a lost or refused batch is not part of this change and is for the owner to decide.
