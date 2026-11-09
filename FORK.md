@@ -328,5 +328,16 @@ indexes that are older than seven days.
   caps its `SessionEnd` hook at 60 seconds. A `SessionEnd` hook that is stopped
   while it flushes is sent again by the next firing of the session (see
   "Delivery").
+- Claude Code 2.1.31x runs the `Stop` hook before it writes the turn's final
+  answer to the log; the rows land 0.3 to 3 seconds later. When the
+  `last_assistant_message` of the `Stop` input is not yet the text of the last
+  assistant message in the log, the `Stop` hook starts the hook again as a
+  detached process with the same input and ends at once. That process waits
+  at most 10 seconds for the answer and then sends the turn as the `Stop` hook
+  would have, so the root carries the final answer. A `Stop` whose answer is in
+  the log, whose input has no `last_assistant_message`, or whose process cannot
+  start sends at once, as before. A `SessionEnd` hook that runs while the
+  process waits sends the turn as it finds it; the session lock, the state and
+  the root claims keep the two from sending anything twice.
 - The `InstructionsLoaded` and `SessionStart` hooks run in the background, so
   they never hold up Claude.

@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -4468,9 +4469,10 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
         # this message has its result (the tool span end), (b) no earlier
         # async launch is unresolved (a late notification would retroactively
         # join this generation's input).
-        # The trailing message needs no extra guard: Stop only fires after a
-        # response is fully written, and no message.id ever grows across a
-        # Stop boundary (0 cases across all local transcripts).
+        # The trailing message needs no extra guard: a Stop whose final answer
+        # is not in the log yet fires only once it is, or after
+        # FINAL_ANSWER_WAIT_SECONDS (wait_for_final_answer), and no message.id
+        # ever grows across a Stop boundary (0 cases across all local transcripts).
         generation_complete = (
             not unresolved_async_launch_seen
             and all(
@@ -5928,6 +5930,80 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> str:
     return verdict
 
 
+# Claude Code 2.1.31x runs the Stop hook before it writes the turn's final
+# assistant rows to the log; they land 0.3 to 3 seconds later. A turn's root is
+# sent once, so a Stop whose final answer is not in the log yet hands its firing
+# to a process of its own, which waits for the answer at most this long and then
+# fires as the Stop would have. The session lock, the state and the root claims
+# keep it apart from other firings of the session, as for any two firings.
+FINAL_ANSWER_WAIT_SECONDS = 10.0
+FINAL_ANSWER_POLL_SECONDS = 0.2
+# The final answer is the last assistant message, so only the end of the log is read.
+FINAL_ANSWER_TAIL_BYTES = 256 * 1024
+WAIT_FOR_FINAL_ANSWER_FLAG = "--wait-for-final-answer"
+
+def get_final_answer_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    answer = payload.get("last_assistant_message")
+    return answer if isinstance(answer, str) and answer.strip() else None
+
+def final_answer_is_missing_from_log(transcript_path: Path, answer: str) -> bool:
+    """True when the last assistant message in the log does not have the answer's text, whitespace aside.
+    A log that cannot be read is not waited for."""
+    try:
+        with open(transcript_path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - FINAL_ANSWER_TAIL_BYTES - 2 * len(answer.encode("utf-8")))
+            f.seek(start)
+            lines = f.read().decode("utf-8", errors="replace").split("\n")
+    except OSError:
+        return False
+    if start > 0:
+        lines = lines[1:]
+    last_message: List[Dict[str, Any]] = []
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or get_user_or_assistant_role_from_row(row) != "assistant":
+            continue
+        if last_message and get_message_id(row) != get_message_id(last_message[0]):
+            break
+        last_message.append(row)
+    text = "".join(extract_text_from_content(get_content_from_row(row)) for row in reversed(last_message))
+    return "".join(text.split()) != "".join(answer.split())
+
+def start_firing_that_waits_for_final_answer(payload: Dict[str, Any]) -> bool:
+    """Start this hook in a process that outlives the Stop hook, waits for the final answer and then fires.
+    False when it did not start; the Stop then fires at once, as before."""
+    if sys.platform == "win32":
+        detached: Dict[str, Any] = {
+            "creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        detached = {"start_new_session": True}
+    try:
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), WAIT_FOR_FINAL_ANSWER_FLAG],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **detached,
+        )
+        process.stdin.write(json.dumps(payload).encode("utf-8"))
+        process.stdin.close()
+    except Exception as e:
+        info(f"could not start a process to wait for the final answer, sending the turn now: "
+             f"{type(e).__name__}: {e}")
+        return False
+    return True
+
+def wait_for_final_answer(transcript_path: Path, answer: Optional[str]) -> None:
+    deadline = time.monotonic() + FINAL_ANSWER_WAIT_SECONDS
+    while answer is not None and final_answer_is_missing_from_log(transcript_path, answer):
+        if time.monotonic() >= deadline:
+            info(f"the final answer did not reach the log within {FINAL_ANSWER_WAIT_SECONDS:g} s; "
+                 f"sending the turn without it")
+            return
+        time.sleep(FINAL_ANSWER_POLL_SECONDS)
+
+
 # ----------------- Main -----------------
 def main() -> int:
     start = time.time()
@@ -5953,6 +6029,15 @@ def main() -> int:
     if flush_deferred_agent_turns:
         sweep_stale_context_files()
         sweep_saved_api_requests()
+    elif WAIT_FOR_FINAL_ANSWER_FLAG in sys.argv[1:]:
+        wait_for_final_answer(transcript_path, get_final_answer_from_payload(payload))
+    else:
+        final_answer = get_final_answer_from_payload(payload)
+        if final_answer is not None and final_answer_is_missing_from_log(transcript_path, final_answer) \
+                and start_firing_that_waits_for_final_answer(payload):
+            info(f"the final answer of session {session_id} is not in the log yet; "
+                 f"a process of its own waits for it and sends the turn")
+            return 0
 
     route_sdk_warnings_to_log()
     install_export_watch()
