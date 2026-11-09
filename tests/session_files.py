@@ -81,6 +81,100 @@ class SessionDir:
         return path
 
 
+def a_session_with(tmp_path: Path, rows: list[dict[str, Any]]) -> SessionDir:
+    session = SessionDir(tmp_path)
+    session.write_main(rows)
+    return session
+
+
+def answer(uuid: str, at: float, text: str) -> dict[str, Any]:
+    return assistant(uuid, at, [{"type": "text", "text": text}])
+
+
+HELPER_TASK = "helper-1"
+HELPER_CALL = "toolu_helper"
+
+
+def notification_text(task_id: str = HELPER_TASK, tool_use_id: str = HELPER_CALL) -> str:
+    return (f"<task-notification>\n<task-id>{task_id}</task-id>\n<tool-use-id>{tool_use_id}</tool-use-id>\n"
+            "<status>completed</status>\n<summary>Done.</summary>\n</task-notification>")
+
+
+def queued(at: float, text: str) -> dict[str, Any]:
+    return {"type": "queue-operation", "operation": "enqueue", "timestamp": stamp(at), "sessionId": SESSION,
+            "content": text}
+
+
+def taken_from_queue(at: float, text: str) -> dict[str, Any]:
+    return {"type": "queue-operation", "operation": "remove", "timestamp": stamp(at), "sessionId": SESSION,
+            "content": text, "reason": "absorbed_mid_turn"}
+
+
+def attached_to_running_turn(uuid: str, at: float, text: str) -> dict[str, Any]:
+    return {"type": "attachment", "timestamp": stamp(at), "sessionId": SESSION, "uuid": uuid,
+            "attachment": {"type": "queued_command", "prompt": text, "commandMode": "task-notification",
+                           "origin": {"kind": "task-notification"}}}
+
+
+def delivered(uuid: str, at: float, text: str) -> dict[str, Any]:
+    return user(uuid, at, text, origin={"kind": "task-notification"})
+
+
+def hand_back(uuid: str, at: float, task_id: str = HELPER_TASK) -> dict[str, Any]:
+    """The helper's final report, sent to the main session as a peer message."""
+    body = "[Subagent hand-back] Report."
+    return user(uuid, at, f'Another Claude session sent a message:\n<agent-message from="{task_id}">\n{body}\n'
+                "</agent-message>", isMeta=True,
+                origin={"kind": "peer", "from": task_id, "senderTaskId": task_id, "body": body})
+
+
+def a_turn_that_launched_a_helper() -> list[dict[str, Any]]:
+    return [user("u1", 0, "Ask a helper."),
+            assistant("a1", 1, [tool_use(HELPER_CALL, "Agent", description="Helper", prompt="Look.")]),
+            tool_result("r1", 2, HELPER_CALL, "Async agent launched successfully.",
+                        status="async_launched", isAsync=True),
+            answer("a2", 3, "The helper runs.")]
+
+
+def a_helper_result_attached_to_the_running_turn() -> list[dict[str, Any]]:
+    note = notification_text()
+    return a_turn_that_launched_a_helper() + [
+        assistant("a3", 4, [tool_use("toolu_read", "Read", file_path="notes.md")]),
+        queued(5, note),
+        taken_from_queue(6, note),
+        tool_result("r2", 6, "toolu_read", "Notes."),
+        attached_to_running_turn("n1", 5, note),
+    ]
+
+
+def a_helper_hand_back() -> list[dict[str, Any]]:
+    return a_turn_that_launched_a_helper() + [queued(10, notification_text()), hand_back("h1", 10)]
+
+
+def answered(rows: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    return rows + [answer("final", 30, text)]
+
+
+def followed_by_the_helper_notification(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return rows + [delivered("n-late", 31, notification_text())]
+
+
+def a_finished_turn_while_a_helper_takes_its_own_background_task_result() -> list[dict[str, Any]]:
+    note = notification_text("bash-1", "toolu_helper_bash")
+    return [user("u1", 0, "Go."), answer("a1", 1, "Done."), queued(5, note), taken_from_queue(6, note)]
+
+
+def a_resumed_helper_that_did_not_hand_back_again() -> list[dict[str, Any]]:
+    note = notification_text(tool_use_id="toolu_resume")
+    return answered(a_helper_hand_back(), "Resuming the helper.") + [
+        assistant("a4", 32, [tool_use("toolu_resume", "SendMessage", to=HELPER_TASK, message="Again.")]),
+        tool_result("r3", 33, "toolu_resume", "Resumed.", resumedAgentId=HELPER_TASK),
+        answer("a5", 34, "The helper runs again."),
+        queued(40, note),
+        delivered("n2", 41, note),
+    ]
+
+
 FORKED = {"agentType": "general-purpose", "isBuiltIn": True, "spawnDepth": 2}
 
 
