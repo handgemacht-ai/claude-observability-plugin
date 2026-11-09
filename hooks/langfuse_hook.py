@@ -2104,6 +2104,13 @@ def match_agents_to_skill_calls(
 def is_plain_file_name(value: Any) -> bool:
     return isinstance(value, str) and bool(value) and value not in (".", "..") and value == Path(value).name
 
+def is_searchable_dir(path: Path) -> bool:
+    """Path.is_dir() raises before Python 3.14 when a folder on the way cannot be searched."""
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
 def get_session_subagent_dirs(transcript_path: Path) -> List[Path]:
     """The subagents/ directories of a session: the one next to its transcript
     first, whether or not it exists, then those under other project folders.
@@ -2118,7 +2125,7 @@ def get_session_subagent_dirs(transcript_path: Path) -> List[Path]:
         project_dirs = []
     other_dirs = [
         project_dir / session_dir.name / "subagents" for project_dir in project_dirs
-        if project_dir != transcript_path.parent and (project_dir / session_dir.name / "subagents").is_dir()
+        if project_dir != transcript_path.parent and is_searchable_dir(project_dir / session_dir.name / "subagents")
     ]
     if other_dirs:
         info(f"session {session_dir.name} has agent files in other project folders: "

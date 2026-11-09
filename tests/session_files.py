@@ -1,11 +1,12 @@
 """Builders for the files Claude Code writes for a session, with synthetic rows only."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 SESSION = "session-launches"
 BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -309,6 +310,18 @@ def a_session_whose_old_helper_folder_was_superseded(tmp_path: Path) -> SessionD
     (superseded / "agent-helper.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in helper_rows(10)), encoding="utf-8")
     return session
+
+
+@contextlib.contextmanager
+def a_project_folder_the_user_cannot_search(tmp_path: Path) -> Iterator[None]:
+    """A folder next to the session's, such as one a sudo or container run left, owned by root with mode 0700."""
+    folder = tmp_path.parent / "folder-of-another-user"
+    (folder / SESSION / "subagents").mkdir(parents=True)
+    folder.chmod(0)
+    try:
+        yield
+    finally:
+        folder.chmod(0o700)
 
 
 def expect_helper_read_from(subagents: dict[str, dict[str, Any]], tool_use_id: str, folder: str) -> None:

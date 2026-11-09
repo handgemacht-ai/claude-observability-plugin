@@ -5,6 +5,7 @@ import json
 
 from tests.session_files import (
     WORKTREE_FOLDER,
+    a_project_folder_the_user_cannot_search,
     a_session_whose_helper_has_its_meta_only_under_the_worktree_folder,
     a_session_whose_helper_has_meta_and_transcript_in_both_folders,
     a_session_whose_helper_wrote_under_a_worktree_folder,
@@ -513,6 +514,15 @@ def test_a_nested_helper_under_the_worktree_folder_is_found_in_the_transcript_of
     subagents = hook_module.get_subagent_transcripts_by_tool_use_id(session.transcript)
 
     expect_helper_read_from(subagents, "toolu_inner", WORKTREE_FOLDER)
+
+
+def test_a_project_folder_the_user_cannot_search_does_not_stop_the_scan(hook_module, tmp_path):
+    session = a_session_whose_helper_wrote_under_a_worktree_folder(tmp_path)
+
+    with a_project_folder_the_user_cannot_search(tmp_path):
+        subagents = hook_module.get_subagent_transcripts_by_tool_use_id(session.transcript)
+
+    expect_helper_read_from(subagents, "toolu_helper", WORKTREE_FOLDER)
 
 
 def test_superseded_session_directories_are_not_read(hook_module, tmp_path):
