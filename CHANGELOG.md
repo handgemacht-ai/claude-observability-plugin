@@ -53,8 +53,9 @@ more of those steps.
   (`partial_success.rejected_spans` in the OTLP answer, read from protobuf or JSON by hand, no new dependency) counts as `lost`, so the firing is undone and sent again like any lost
   one; the log gets `rejected_spans` and `error_message`. The warnings and errors of the `opentelemetry` and `langfuse` loggers, such as a batch dropped above the request size limit,
   are written to the hook log. The client sends a request for every 25 spans (about 2.5 MB at 100 KB per span; left to the SDK when `LANGFUSE_FLUSH_AT` is set), and a `Stop`
-  firing flushes after the spans of each helper that the main agent launched (nested helpers go out with their parent), capped at the 5 second flush timeout; after one flush
-  that does not finish in time, it stops flushing between helpers for that firing. A `SessionEnd` firing does not flush between helpers, since Claude Code gives it 1.5
+  firing flushes after the spans of each helper that the main agent launched (nested helpers go out with their parent). These flushes get the 5 second flush timeout in total, and it
+  stops flushing between helpers for that firing once they used it or after a flush whose batch did not reach Langfuse, so an unreachable Langfuse (about 3 seconds per flush)
+  does not cost that for every helper. A `SessionEnd` firing does not flush between helpers, since Claude Code gives it 1.5
   seconds in total. Span contents and the metadata keys the gate reads are unchanged.
 - `FORK.md` describes them. Version raised to `1.3.0-handgemacht.11` in `.claude-plugin/plugin.json`.
 
@@ -79,7 +80,7 @@ more of those steps.
   `partial_success` bytes are read; an oversize drop writes its warning to the hook log. For 427 spans of 100 KB: on an 8 MB/s link the SDK default sent one 42.8 MB request that hit the 5 second flush cap
   and counted as lost, and the new setting sent 18 requests of at most 2.5 MB with a 4.1 second tail, delivered. On a 3 MB/s link both hit the cap, and the new setting got 225 of 427 spans through
   where the old one got none. Log lines: "Langfuse answered a batch of spans with a partial success: rejected_spans=N", "[WARNING] opentelemetry…: Dropping span batch: …",
-  "flush between helpers did not finish within 5 s; the rest is sent at the end".
+  "flushes between helpers did not finish within 5 s in total; the rest is sent at the end", "a flush between helpers did not reach Langfuse; the rest is sent at the end".
 - `uv run --group dev pytest`: 524 tests (Python 3.10 and 3.13), 45 of them new. Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
   17 of the 28 export tests fail; the others guard behaviour that must stay (`tests/unit/test_subagent_discovery.py`, `tests/integration/test_helpers_of_agents.py`,
   `tests/integration/test_notification_deliveries.py`, `tests/integration/test_woken_helpers.py`, `tests/integration/test_export_loss.py`, builders in `tests/session_files.py`,

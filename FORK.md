@@ -131,8 +131,9 @@ Everything else works as described in the [README](./README.md).
     `LANGFUSE_FLUSH_AT`. In a `Stop` firing, the spans of each helper that the
     main agent launched are flushed when the hook has handed them to the SDK
     (nested helpers go out with their parent), so a big turn goes out helper by
-    helper. A flush that does not finish within 5 seconds ends this for the
-    firing; the flush at the end tells what did not arrive. A `SessionEnd`
+    helper. These flushes get 5 seconds in total, and a flush whose batch did
+    not reach Langfuse ends them too, so a slow or unreachable Langfuse does not
+    cost seconds per helper; the flush at the end tells what did not arrive. A `SessionEnd`
     firing does not flush between helpers, since it has 1.5 seconds in total.
   - The warnings and errors of the `opentelemetry` and `langfuse` loggers go to
     the hook log (`langfuse_hook.log` in the state folder), for example "Dropping
