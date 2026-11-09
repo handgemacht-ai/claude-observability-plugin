@@ -17,8 +17,11 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
 [PR #NN](https://github.com/handgemacht-ai/claude-observability-plugin/pull/NN), on top of PR #11. Commits in landing order:
 `a02fa72` (helpers under the project folder of a worktree), `4f5886a` (newer forms of a helper's notification), `beb3b25` (helpers that
 their own background task wakes), `03594c5` (rejected spans, smaller requests, the SDK's warnings in the hook log), `43826c0` (`FORK.md`),
-`6bee775` (version) and the commit that adds this entry. Each of the code commits has its own tests, and the whole suite passes after each of
-them in this order. "Before" in this entry is release `1.3.0-handgemacht.10`.
+`6bee775` (version) and the commit that adds this entry. Each of these code commits has its own tests, and the whole suite passes after each of
+them in this order. Review fixes on top: `f1ff7c8` (a project folder the user cannot search), `b5fadd8` (journal results of a Workflow run split over two folders),
+`6eada7d` (tests of the notification guards), `beb3398` (a hand-back with a note before its marker), `f9034dd` (woken runs cut only at queued stops, helpers of helpers
+not cut), `300232b` (a woken run sent once), `e4cb416` (test of a `SendMessage` run after a woken run), `e2b83f5` (one flush budget between helpers), `0d7c9db` (replies to
+repeat notifications) and the commit that lists them; the whole suite passes after the last of them. "Before" in this entry is release `1.3.0-handgemacht.10`.
 
 A read-only test of the behaviour gate on 4 November found about 3,400 records waiting, because the plugin never sent their step to Langfuse.
 The gate finds a step by the plugin's `Tool: <name>` observation (`metadata.tool_id`) or, for a final answer, by the plugin's LLM call
@@ -74,6 +77,9 @@ more of those steps.
   keeps the same log file. In the hook log of a running session: "session <id> has agent files in other project folders: …". In Langfuse, the number of waiting gate records of worktree
   sessions drops.
 - Held turns, replaying the three real turns read-only, nothing sent: each is held by release 10 and not held by this change.
+- Woken runs after the review fixes, replaying real sessions offline with a stubbed Langfuse (a `Stop` and a `SessionEnd` firing, nothing sent): 6f4d9428 sends 8,898 tool steps like release 10
+  (8,409 before the fix; helper a2fe5255 26 of 26, was 5), f7cc93fa 552 (348), e5b47e83 198 (178); 63e8b15b and c0019e59 send no tool step twice (729 and 346 before), and each of these sessions
+  sends every step that release 10 sent.
 - Woken helpers, replaying the three real helpers above the same way: calls sent after the whole log 55 of 55 in 4 runs (16 before), 27 of 27 (17) and 92 of 92 (90); no call sent twice. In
   Langfuse: `Subagent: … (resumed #n)` under the span of the main turn that holds the helper's next stop.
 - Export, with the changed hook against the real SDK (4.18, OpenTelemetry 1.45) and a local collector on 127.0.0.1 with a state folder of its own: batches arrive as 25, 25, 25, 25; real protobuf
@@ -81,11 +87,13 @@ more of those steps.
   and counted as lost, and the new setting sent 18 requests of at most 2.5 MB with a 4.1 second tail, delivered. On a 3 MB/s link both hit the cap, and the new setting got 225 of 427 spans through
   where the old one got none. Log lines: "Langfuse answered a batch of spans with a partial success: rejected_spans=N", "[WARNING] opentelemetry…: Dropping span batch: …",
   "flushes between helpers did not finish within 5 s in total; the rest is sent at the end", "a flush between helpers did not reach Langfuse; the rest is sent at the end".
-- `uv run --group dev pytest`: 524 tests (Python 3.10 and 3.13), 45 of them new. Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
+- `uv run --group dev pytest`: 537 tests, 58 of them new (524 before the review fixes, run on Python 3.10 and 3.13; the review fixes were run on 3.13 only). Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
   17 of the 28 export tests fail; the others guard behaviour that must stay (`tests/unit/test_subagent_discovery.py`, `tests/integration/test_helpers_of_agents.py`,
   `tests/integration/test_notification_deliveries.py`, `tests/integration/test_woken_helpers.py`, `tests/integration/test_export_loss.py`, builders in `tests/session_files.py`,
   `tests/held_turns.py`, `tests/woken_helpers.py` and `tests/export_helpers.py`), all with synthetic rows. `uvx ruff check --select F,E9 .` is clean, and `echo '{}' | uv run --script hooks/langfuse_hook.py`
   with a scratch state folder exits 0.
+- Review fixes: each of the 9 tests that come with a fix fails before it. The 4 guard tests (a remove row without a reason, `delivered_to_agent`, a hand-back next to another helper's queued
+  notification, a `SendMessage` run after a woken run) pass before and fail only under the change they pin.
 
 **How to undo**
 - Revert the PR's commits and update the plugin. Release 10 reads helper files next to the log only, holds a turn as before, sends a woken helper once, and its client sends at the SDK's
@@ -97,7 +105,8 @@ more of those steps.
 - Open decision, split helper runs: in 6a854ffe, 2 of 28 helpers have files in both folders, and they are not copies. Each is one run split in time: the early part (with the full meta) is in the folder of
   the worktree, the later part (after the session left the worktree, with a shorter meta or none) in the folder of the main log, and they share no rows. The plugin reads one file per helper, so the other
   part is still not sent. In 6101bcb5 this happens 0 times in 70. Merging a helper's logs from all folders in time order would be a larger change to how helper rows are read; keeping the rule is
-  recommended until the gate shows how many records still wait.
+  recommended until the gate shows how many records still wait. A helper that the unread part launched is not sent either: in 6a854ffe, a4bc6c1f under reviewer a90d5e5e, whose
+  launch is in the part under the worktree's folder.
 - A project folder that is itself named `*.superseded-*` is not excluded; none exists in the data.
 - A remove row counts as delivered only when it names a reason. Rows without one (older Claude Code) still hold the turn, the safe direction. Upstream (langfuse/Claude-Observability-Plugin) PR 113 counts every remove row; this is a choice.
 - A hand-back is recognised by a peer message whose origin has `handback: true` (all 2,541 hand-backs in the logs) or whose text starts with `[Subagent hand-back]`. If both change, turns are held again and the old bug is back.
@@ -108,6 +117,12 @@ more of those steps.
 - A helper woken after its `SubagentHandback` call counts as woken. The change relies on the queued-notification rows that Claude Code 2.1.31x writes in the main log, and does not cover helpers of helpers that
   their own tasks wake (they are sent whole with their parent, so rows they write after that are still missing, as in release 10) nor a wake row whose text starts directly with `<task-notification>`. A woken run sits under the span of the main turn that holds the
   helper's next stop, not under the original `Agent` call. Each firing reads again the log of each helper that has a queued notification in the open turn, a small extra cost.
+- Rows that a woken helper writes after a resume the plugin does not see (a peer message, or a `SendMessage` result without `resumedAgentId` before Claude Code 2.1.197) are not sent, as in
+  release 10; only the run before goes out, once.
+- A firing now goes out as many requests (every 25 spans, and a flush after each helper in a `Stop` firing). When one of them is lost (a 500, 408 or 425, which the exporter does not retry, or no
+  answer after its retries) or the firing is stopped during the early flushes, the whole firing is undone, and the next firing sends again the pieces that had arrived, as duplicates under the
+  same span ids. Before, a turn usually went out as one request that arrived whole or not at all. Confirming delivery and saving progress per flushed piece would avoid this, but it changes how a
+  firing is undone and is for the owner to decide.
 - A batch that the exporter drops above its request size limit makes no request, so the watch cannot see it: with the real SDK it still counts as `delivered` and the state is saved. It shows only as a
   warning in the hook log. Counting that warning as a lost or refused batch is not part of this change and is for the owner to decide.
 - The 5 second flush timeout is unchanged. A very big send over a slow link still cannot finish inside it: smaller batches let more of it arrive in the background, and the next firing sends the whole turn
