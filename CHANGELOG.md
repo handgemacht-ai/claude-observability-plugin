@@ -14,15 +14,15 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
 
 ### Helper steps reach Langfuse: helpers under a worktree's folder, turns held for finished helpers, woken helpers, rejected spans, the final answer at Stop (release 1.3.0-handgemacht.11)
 
-[PR #NN](https://github.com/handgemacht-ai/claude-observability-plugin/pull/NN), on top of PR #11. Commits in landing order:
+[PR #13](https://github.com/handgemacht-ai/claude-observability-plugin/pull/13), on top of PR #11. Commits in landing order:
 `a02fa72` (helpers under the project folder of a worktree), `4f5886a` (newer forms of a helper's notification), `beb3b25` (helpers that
 their own background task wakes), `03594c5` (rejected spans, smaller requests, the SDK's warnings in the hook log), `43826c0` (`FORK.md`),
-`6bee775` (version) and the commit that adds this entry. Each of these code commits has its own tests, and the whole suite passes after each of
+`6bee775` (version) and `06f51fe` (this entry). Each of these code commits has its own tests, and the whole suite passes after each of
 them in this order. Review fixes on top: `f1ff7c8` (a project folder the user cannot search), `b5fadd8` (journal results of a Workflow run split over two folders),
 `6eada7d` (tests of the notification guards), `beb3398` (a hand-back with a note before its marker), `f9034dd` (woken runs cut only at queued stops, helpers of helpers
 not cut), `300232b` (a woken run sent once), `e4cb416` (test of a `SendMessage` run after a woken run), `e2b83f5` (one flush budget between helpers), `0d7c9db` (replies to
 repeat notifications), `c122695` (the list of these fixes), `5c6b075` (back to one request per firing, rejected spans count as refused), `fb07859` (a `Stop` firing waits for its final
-answer) and the commit that holds the session lock until a firing knows whether its spans arrived; the whole suite passes after the last of them. "Before" in this entry is release `1.3.0-handgemacht.10`.
+answer) and `dd47b8d` (the session lock held until a firing knows whether its spans arrived); the whole suite passes after the last of them. "Before" in this entry is release `1.3.0-handgemacht.10`.
 
 A read-only test of the behaviour gate on 4 November found about 3,400 records waiting, because the plugin never sent their step to Langfuse.
 The gate finds a step by the plugin's `Tool: <name>` observation (`metadata.tool_id`) or, for a final answer, by the plugin's LLM call
