@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 
 # ----------------- Configuration -----------------
@@ -1091,13 +1091,41 @@ def is_task_notification_row(row: Dict[str, Any]) -> bool:
     notification_text = extract_text_from_content(get_content_from_row(row)).lstrip()
     return notification_text.startswith("<task-notification>")
 
+def is_task_notification_attachment_row(row: Dict[str, Any]) -> bool:
+    """A task notification that landed while the turn was running: Claude Code
+    attaches it to the turn's next request instead of writing a user row."""
+    attachment = row.get("attachment") if row.get("type") == "attachment" else None
+    return (
+        isinstance(attachment, dict)
+        and attachment.get("type") == "queued_command"
+        and attachment.get("commandMode") == "task-notification"
+    )
+
+def get_hand_back_task_id(row: Dict[str, Any]) -> Optional[str]:
+    """Task id of the helper whose final report this user row hands back as a
+    peer message; the helper's task notification is queued with it."""
+    origin = row.get("origin")
+    if get_user_or_assistant_role_from_row(row) != "user" or not isinstance(origin, dict):
+        return None
+    body = origin.get("body")
+    if origin.get("kind") != "peer" or not isinstance(body, str) or not body.startswith("[Subagent hand-back]"):
+        return None
+    task_id = origin.get("senderTaskId")
+    return task_id if isinstance(task_id, str) and task_id else None
+
+def get_task_notification_text(row: Dict[str, Any]) -> str:
+    if is_task_notification_attachment_row(row):
+        prompt = row["attachment"].get("prompt")
+        return prompt if isinstance(prompt, str) else ""
+    return extract_text_from_content(get_content_from_row(row))
+
 def get_tool_use_id_from_task_notification(row: Dict[str, Any]) -> Optional[str]:
-    notification_text = extract_text_from_content(get_content_from_row(row))
+    notification_text = get_task_notification_text(row)
     tool_use_id = _extract_xml_tag_value(notification_text, "tool-use-id")
     return tool_use_id.strip() if isinstance(tool_use_id, str) and tool_use_id.strip() else None
 
 def get_task_id_from_task_notification(row: Dict[str, Any]) -> Optional[str]:
-    notification_text = extract_text_from_content(get_content_from_row(row))
+    notification_text = get_task_notification_text(row)
     task_id = _extract_xml_tag_value(notification_text, "task-id")
     return task_id.strip() if isinstance(task_id, str) and task_id.strip() else None
 
@@ -1316,26 +1344,53 @@ def get_pending_agent_tool_use_ids(turn: Turn) -> List[str]:
     return tool_use_ids
 
 
-def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[str]:
-    """Tool-use ids of task notifications that were enqueued (queue-operation
-    rows) but not yet delivered as a user row.
-
-    A queued result already fills the launch entry's final_content, so the
-    pending-agents check goes clean — yet the turn provably continues: the
-    delivery row and Claude's follow-up response are still outstanding.
-    Queue remove rows carry no notification content and cannot be matched, so
-    a removed notification keeps the gate closed until the turn ends — the
-    safe direction (close-time emission is always correct).
-    """
-    queued: List[str] = []
-    delivered = set()
+def get_handed_back_tool_use_ids(rows: List[Dict[str, Any]]) -> Set[str]:
+    """Tool-use ids of task notifications whose helper handed back its final
+    report after the call that launched or resumed it."""
+    launch_index_by_tool_use_id: Dict[str, int] = {}
+    hand_back_index_by_task_id: Dict[str, int] = {}
+    for index, row in enumerate(rows):
+        for tool_use_block in get_tool_use_blocks(get_content_from_row(row)):
+            launch_index_by_tool_use_id.setdefault(str(tool_use_block.get("id")), index)
+        task_id = get_hand_back_task_id(row)
+        if task_id:
+            hand_back_index_by_task_id[task_id] = index
+    handed_back = set()
     for row in rows:
         if not is_task_notification_row(row):
             continue
         tool_use_id = get_tool_use_id_from_task_notification(row)
+        hand_back_index = hand_back_index_by_task_id.get(get_task_id_from_task_notification(row) or "")
+        if hand_back_index is None or not tool_use_id:
+            continue
+        if hand_back_index > launch_index_by_tool_use_id.get(tool_use_id, -1):
+            handed_back.add(tool_use_id)
+    return handed_back
+
+
+def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[str]:
+    """Tool-use ids of task notifications that were enqueued (queue-operation
+    rows) but not yet delivered.
+
+    A queued result already fills the launch entry's final_content, so the
+    pending-agents check goes clean — yet the turn provably continues: the
+    delivery row and Claude's follow-up response are still outstanding.
+    Delivered means a user row, an attachment to the running turn, the
+    helper's hand-back, or a queue remove row that names its reason
+    (absorbed_mid_turn, delivered_to_agent): it repeats the notification and
+    took it out of the queue. Remove rows without a reason keep the gate
+    closed until the turn ends — the safe direction (close-time emission is
+    always correct).
+    """
+    queued: List[str] = []
+    delivered = get_handed_back_tool_use_ids(rows)
+    for row in rows:
+        if not is_task_notification_row(row) and not is_task_notification_attachment_row(row):
+            continue
+        tool_use_id = get_tool_use_id_from_task_notification(row)
         if not tool_use_id:
             continue
-        if row.get("type") == "queue-operation":
+        if row.get("type") == "queue-operation" and not row.get("reason"):
             queued.append(tool_use_id)
         else:
             delivered.add(tool_use_id)
@@ -1343,13 +1398,22 @@ def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[
 
 
 def notification_awaits_answer(rows: List[Dict[str, Any]]) -> bool:
-    """True when a delivered task notification comes after the turn's last
-    assistant row: the agent's answer to it is still to come. The Stop after
-    that answer can fire before the answer reaches the transcript file."""
+    """True when a delivered task notification or a helper's hand-back comes
+    after the turn's last assistant row: the agent's answer to it is still to
+    come. The Stop after that answer can fire before the answer reaches the
+    transcript file. A notification delivered after its helper handed back
+    repeats the answered report and gets no answer of its own."""
+    handed_back = get_handed_back_tool_use_ids(rows)
     for row in reversed(rows):
         if get_user_or_assistant_role_from_row(row) == "assistant":
             return False
-        if is_task_notification_row(row) and row.get("type") != "queue-operation":
+        if is_task_notification_attachment_row(row) or get_hand_back_task_id(row):
+            return True
+        if (
+            is_task_notification_row(row)
+            and row.get("type") != "queue-operation"
+            and get_tool_use_id_from_task_notification(row) not in handed_back
+        ):
             return True
     return False
 
@@ -1411,6 +1475,19 @@ def add_injected_context_row(row: Dict[str, Any], state: TurnAssemblyState) -> b
         if text:
             state.injected_by_tool_id[str(source_tool_use_id)] = text
             state.current_rows.append(row)
+    # A helper's hand-back delivers its result; the emission gate reads it from the turn's rows.
+    if get_hand_back_task_id(row):
+        state.current_rows.append(row)
+    return True
+
+def add_task_notification_attachment_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
+    """Keep a notification attached to the running turn in the turn's rows for
+    the emission gate. The queued row of the same notification already carried
+    its result."""
+    if not is_task_notification_attachment_row(row):
+        return False
+    if state.current_turn_user_row is not None:
+        state.current_rows.append(row)
     return True
 
 def add_interrupted_turn_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
@@ -1631,6 +1708,9 @@ def assemble_turns(
             continue
 
         if add_task_notification_row(row, state, task_id_to_tool_use_id, closed_turns=turns):
+            continue
+
+        if add_task_notification_attachment_row(row, state):
             continue
 
         if add_interrupted_turn_row(row, state):
