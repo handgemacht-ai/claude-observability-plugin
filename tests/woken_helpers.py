@@ -14,14 +14,17 @@ from tests.session_files import (
     a_helper_of_a_helper_that_its_own_background_task_wakes,
     a_helper_that_waits_on_a_helper_of_its_own,
     a_helper_that_waits_on_its_own_background_task,
+    a_later_turn,
     a_main_turn_answered_at_the_helper_first_stop,
     a_main_turn_that_waited_for_a_helper,
     a_session_with,
     answered_at_the_helper_later_stop,
+    answered_at_the_helper_next_stop,
     notification_of_a_later_stop,
     queued,
     stopped_again,
     waiting_on_a_second_background_task,
+    woken_by_a_peer_message,
     woken_by_its_background_task,
     woken_by_its_second_background_task,
 )
@@ -64,6 +67,23 @@ def the_helper_wakes_twice_and_only_its_last_stop_is_reported(session: SessionDi
         HELPER_META,
     )
     session.write_main(answered_at_the_helper_later_stop(a_main_turn_answered_at_the_helper_first_stop(), at=50))
+
+
+def sent_until_a_later_turn_closed_the_launching_one(hook_module: Any, fake_langfuse: Any, session: SessionDir) -> None:
+    fire(hook_module, fake_langfuse, session)
+    session.write_main(a_later_turn(answered_at_the_helper_later_stop(a_main_turn_answered_at_the_helper_first_stop())))
+    fire(hook_module, fake_langfuse, session)
+
+
+def a_peer_message_wakes_the_helper_and_its_next_stop_lands_in_the_later_turn(session: SessionDir) -> None:
+    session.add_agent(
+        HELPER_TASK,
+        woken_by_a_peer_message(stopped_again(woken_by_its_background_task(
+            a_helper_that_waits_on_its_own_background_task()))),
+        HELPER_META,
+    )
+    session.write_main(answered_at_the_helper_next_stop(
+        a_later_turn(answered_at_the_helper_later_stop(a_main_turn_answered_at_the_helper_first_stop()))))
 
 
 def a_session_whose_helper_of_a_helper_its_own_background_task_wakes(
