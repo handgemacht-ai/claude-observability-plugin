@@ -21,7 +21,8 @@ their own background task wakes), `03594c5` (rejected spans, smaller requests, t
 them in this order. Review fixes on top: `f1ff7c8` (a project folder the user cannot search), `b5fadd8` (journal results of a Workflow run split over two folders),
 `6eada7d` (tests of the notification guards), `beb3398` (a hand-back with a note before its marker), `f9034dd` (woken runs cut only at queued stops, helpers of helpers
 not cut), `300232b` (a woken run sent once), `e4cb416` (test of a `SendMessage` run after a woken run), `e2b83f5` (one flush budget between helpers), `0d7c9db` (replies to
-repeat notifications) and the commit that lists them; the whole suite passes after the last of them. "Before" in this entry is release `1.3.0-handgemacht.10`.
+repeat notifications), `c122695` (the list of these fixes) and the commit that goes back to one request per firing and counts rejected spans as refused; the whole suite
+passes after the last of them. "Before" in this entry is release `1.3.0-handgemacht.10`.
 
 A read-only test of the behaviour gate on 4 November found about 3,400 records waiting, because the plugin never sent their step to Langfuse.
 The gate finds a step by the plugin's `Tool: <name>` observation (`metadata.tool_id`) or, for a final answer, by the plugin's LLM call
@@ -52,14 +53,16 @@ more of those steps.
   The main turn that holds the first queued notification after the wake sends the later run, once, under its own span: the span of the launching call was sent and closed with the first
   run. A later queued notification that no new run start precedes (a resume the plugin does not see, such as a peer message or a `SendMessage` result without `resumedAgentId` before Claude
   Code 2.1.197) does not send it again. Helpers of helpers are not cut and are sent whole with their parent, as in release 10.
-- **Rejected spans, smaller requests, the SDK's warnings** (`ExportWatch`, `EXPORT_BATCH_SPANS`, `PieceFlush`, `SdkLogRelay`). A batch that Langfuse took with spans rejected
-  (`partial_success.rejected_spans` in the OTLP answer, read from protobuf or JSON by hand, no new dependency) counts as `lost`, so the firing is undone and sent again like any lost
-  one; the log gets `rejected_spans` and `error_message`. The warnings and errors of the `opentelemetry` and `langfuse` loggers, such as a batch dropped above the request size limit,
-  are written to the hook log. The client sends a request for every 25 spans (about 2.5 MB at 100 KB per span; left to the SDK when `LANGFUSE_FLUSH_AT` is set), and a `Stop`
-  firing flushes after the spans of each helper that the main agent launched (nested helpers go out with their parent). These flushes get the 5 second flush timeout in total, and it
-  stops flushing between helpers for that firing once they used it or after a flush whose batch did not reach Langfuse, so an unreachable Langfuse (about 3 seconds per flush)
-  does not cost that for every helper. A `SessionEnd` firing does not flush between helpers, since Claude Code gives it 1.5
-  seconds in total. Span contents and the metadata keys the gate reads are unchanged.
+- **Rejected spans, the SDK's warnings** (`ExportWatch`, `SdkLogRelay`). A batch that Langfuse took with spans rejected (`partial_success.rejected_spans` in the OTLP answer, read
+  from protobuf or JSON by hand, no new dependency) counts as `refused`: the hook log gets a warning with `rejected_spans` and `error_message`, and the firing is not undone and not sent
+  again, since that would send the spans Langfuse took a second time. The warnings and errors of the `opentelemetry` and `langfuse` loggers, such as a batch dropped above the request
+  size limit, are written to the hook log. The client sends at the SDK's batch size and flushes once at the end of a firing, as in release 10. Span contents and the metadata keys the
+  gate reads are unchanged.
+- **Smaller requests dropped.** `03594c5` made the client send a request for every 25 spans and a `Stop` firing flush after each helper, and `e2b83f5` gave those flushes one 5 second
+  budget. The review found that this makes duplicates: Langfuse here only adds events, and the undo after a lost request covers the whole firing, so when one of the many requests of a
+  firing was lost (a 500, 408 or 425, which the exporter does not retry, or no answer after its retries), or the firing was stopped during the early flushes, the next firing sent again
+  the requests that had arrived. The main session decided on the user's behalf, as the safe default, to go back to one request per firing and to count a partial success as refused,
+  not lost, for the same reason. A request with no answer, a 5xx or a flush that did not finish still counts as lost and is undone.
 - `FORK.md` describes them. Version raised to `1.3.0-handgemacht.11` in `.claude-plugin/plugin.json`.
 
 **Why**
@@ -70,7 +73,7 @@ more of those steps.
   90 of 92. Of 65 wake rows counted in the logs, 56 (41 helpers) follow an answer with no tool call and 9 follow a hand-back.
 - Lost spans: a held turn of 427 spans of about 100 KB each went out as one request of 44 MB, since the SDK sends when 512 spans are queued and the rest at the end. In the lost send a
   block of 352 spans never arrived, and nothing in the hook log said why: the exporter drops a batch above its request size limit with a warning on its own logger, and Langfuse can take
-  a batch with spans rejected, and neither was written to the hook log.
+  a batch with spans rejected, and neither was written to the hook log. Now both are; the cause of that loss is still open.
 
 **How to tell it works**
 - Worktree helpers, offline on the two real sessions above (nothing sent, the shared Langfuse was not contacted): 38 to 70 and 14 to 27 helper launches attributed, and each helper attributed before
@@ -82,22 +85,22 @@ more of those steps.
   sends every step that release 10 sent.
 - Woken helpers, replaying the three real helpers above the same way: calls sent after the whole log 55 of 55 in 4 runs (16 before), 27 of 27 (17) and 92 of 92 (90); no call sent twice. In
   Langfuse: `Subagent: … (resumed #n)` under the span of the main turn that holds the helper's next stop.
-- Export, with the changed hook against the real SDK (4.18, OpenTelemetry 1.45) and a local collector on 127.0.0.1 with a state folder of its own: batches arrive as 25, 25, 25, 25; real protobuf
-  `partial_success` bytes are read; an oversize drop writes its warning to the hook log. For 427 spans of 100 KB: on an 8 MB/s link the SDK default sent one 42.8 MB request that hit the 5 second flush cap
-  and counted as lost, and the new setting sent 18 requests of at most 2.5 MB with a 4.1 second tail, delivered. On a 3 MB/s link both hit the cap, and the new setting got 225 of 427 spans through
-  where the old one got none. Log lines: "Langfuse answered a batch of spans with a partial success: rejected_spans=N", "[WARNING] opentelemetry…: Dropping span batch: …",
-  "flushes between helpers did not finish within 5 s in total; the rest is sent at the end", "a flush between helpers did not reach Langfuse; the rest is sent at the end".
-- `uv run --group dev pytest`: 537 tests, 58 of them new (524 before the review fixes, run on Python 3.10 and 3.13; the review fixes were run on 3.13 only). Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
-  17 of the 28 export tests fail; the others guard behaviour that must stay (`tests/unit/test_subagent_discovery.py`, `tests/integration/test_helpers_of_agents.py`,
+- Export, with `03594c5` against the real SDK (4.18, OpenTelemetry 1.45) and a local collector on 127.0.0.1 with a state folder of its own: real protobuf `partial_success` bytes are read, and an
+  oversize drop writes its warning to the hook log. The SDK's batch size, which this entry goes back to, sent 427 spans of 100 KB as one 42.8 MB request that hit the 5 second flush cap on an
+  8 MB/s link and counted as lost. Not run again against the collector after the change back. Log lines: "[WARNING] Langfuse answered a batch of spans with a partial success:
+  rejected_spans=N error_message='…'; the rejected spans are lost and the batch is not sent again", "[WARNING] opentelemetry…: Dropping span batch: …".
+- `uv run --group dev pytest`: 531 tests, 52 of them new (524 before the review fixes, run on Python 3.10 and 3.13; the review fixes were run on 3.13 only). Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
+  11 of the 24 export tests fail; the others guard behaviour that must stay (`tests/unit/test_subagent_discovery.py`, `tests/integration/test_helpers_of_agents.py`,
   `tests/integration/test_notification_deliveries.py`, `tests/integration/test_woken_helpers.py`, `tests/integration/test_export_loss.py`, builders in `tests/session_files.py`,
   `tests/held_turns.py`, `tests/woken_helpers.py` and `tests/export_helpers.py`), all with synthetic rows. `uvx ruff check --select F,E9 .` is clean, and `echo '{}' | uv run --script hooks/langfuse_hook.py`
   with a scratch state folder exits 0.
-- Review fixes: each of the 9 tests that come with a fix fails before it. The 4 guard tests (a remove row without a reason, `delivered_to_agent`, a hand-back next to another helper's queued
+- Review fixes: each of the 7 tests that come with a fix fails before it (the 2 of `e2b83f5` went with the flushes between helpers), and so do 6 of the export tests that the change back to one
+  request per firing changes or adds; the `SessionEnd` case of its flush test passes before and after. The 4 guard tests (a remove row without a reason, `delivered_to_agent`, a hand-back next to another helper's queued
   notification, a `SendMessage` run after a woken run) pass before and fail only under the change they pin.
 
 **How to undo**
-- Revert the PR's commits and update the plugin. Release 10 reads helper files next to the log only, holds a turn as before, sends a woken helper once, and its client sends at the SDK's
-  default size again. Spans already sent stay in Langfuse. The few emitted keys that woken runs leave in `langfuse_state.json` (`subagent:<agent id>@<time>`) are not read by release 10.
+- Revert the PR's commits and update the plugin. Release 10 reads helper files next to the log only, holds a turn as before, sends a woken helper once, and does not read
+  `partial_success` or the SDK's loggers. Spans already sent stay in Langfuse. The few emitted keys that woken runs leave in `langfuse_state.json` (`subagent:<agent id>@<time>`) are not read by release 10.
 
 **Known limits**
 - Sessions that were already sent are not sent again, so the waiting records of those sessions (about 48 for woken helpers) only clear when the sessions are sent again. Whether to send them
@@ -119,17 +122,16 @@ more of those steps.
   helper's next stop, not under the original `Agent` call. Each firing reads again the log of each helper that has a queued notification in the open turn, a small extra cost.
 - Rows that a woken helper writes after a resume the plugin does not see (a peer message, or a `SendMessage` result without `resumedAgentId` before Claude Code 2.1.197) are not sent, as in
   release 10; only the run before goes out, once.
-- A firing now goes out as many requests (every 25 spans, and a flush after each helper in a `Stop` firing). When one of them is lost (a 500, 408 or 425, which the exporter does not retry, or no
-  answer after its retries) or the firing is stopped during the early flushes, the whole firing is undone, and the next firing sends again the pieces that had arrived, as duplicates under the
-  same span ids. Before, a turn usually went out as one request that arrived whole or not at all. Confirming delivery and saving progress per flushed piece would avoid this, but it changes how a
-  firing is undone and is for the owner to decide.
+- A firing of more than 512 spans, or one that takes longer than 5 seconds to hand its spans to the SDK, still goes out as more than one request, as in release 10, and when one of them is lost
+  the next firing sends the others again.
+- The spans that Langfuse rejects in a partial success stay lost. Such a firing gives its root claims back like any refused firing, so another plugin process with a state folder of its own could
+  send that root again.
 - A batch that the exporter drops above its request size limit makes no request, so the watch cannot see it: with the real SDK it still counts as `delivered` and the state is saved. It shows only as a
   warning in the hook log. Counting that warning as a lost or refused batch is not part of this change and is for the owner to decide.
-- The 5 second flush timeout is unchanged. A very big send over a slow link still cannot finish inside it: smaller batches let more of it arrive in the background, and the next firing sends the whole turn
-  again (duplicates under the same span id, up to three tries in a row). Raising the timeout, or the SDK's own 5 second request timeout, is a separate decision.
-- The batch size 25 (`EXPORT_BATCH_SPANS`) is a pick, not measured against the real Langfuse, and the `SessionEnd` timing was checked against a local collector only, not inside Claude Code's 1.5 seconds in a real
-  session. A turn held until `SessionEnd` relies on the batch size alone, since that firing does not flush between helpers.
-- The cause of the lost block of 352 spans is not proven. This change makes such losses visible and the requests smaller, and was not shown to be the cause.
+- The 5 second flush timeout is unchanged. A very big send over a slow link still cannot finish inside it: the request can still arrive after the hook gave up, and the next firing sends the whole
+  turn again (duplicates under the same span id, up to three tries in a row). Raising the timeout, or the SDK's own 5 second request timeout, is a separate decision.
+- The cause of the lost block of 352 spans is still open. This change makes such a loss visible in the hook log (a batch dropped above the size limit, spans that Langfuse rejected) and does not
+  prevent it.
 - **Not fixed: the final answer of an idle session.** At `Stop` the hook starts sending before Claude Code 2.1.314 has written the final answer to the log (it was missing at the last firing in 11 of 11 sessions
   looked at). It saves where it stopped reading, and the root of the turn goes out with the answer it has, and a root is sent once, so the final answer is lost when the session then goes idle. The `Stop` hook
   runs synchronously (600 seconds), and its input has an optional `last_assistant_message` with the text of the final answer. It is not part of this change, since how the `Stop` firing should wait for the answer needs a choice between three options. Option A: wait inside the `Stop` hook for a few seconds when the answer is missing (smallest, but holds the session on most turns, and costs the full wait if
