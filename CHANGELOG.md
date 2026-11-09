@@ -10,6 +10,116 @@ Installed plugins do not update themselves. After a release, run `claude plugin 
 Numbers below come from the local session logs of the last 30 days in both profiles (`~/.claude` and `~/.claude_agents`),
 read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" is this change.
 
+## 2026-11-09
+
+### Helper steps reach Langfuse: helpers under a worktree's folder, turns held for finished helpers, woken helpers, rejected spans (release 1.3.0-handgemacht.11)
+
+[PR #NN](https://github.com/handgemacht-ai/claude-observability-plugin/pull/NN), on top of PR #11. Commits in landing order:
+`a02fa72` (helpers under the project folder of a worktree), `4f5886a` (newer forms of a helper's notification), `beb3b25` (helpers that
+their own background task wakes), `03594c5` (rejected spans, smaller requests, the SDK's warnings in the hook log), `43826c0` (`FORK.md`),
+`6bee775` (version) and the commit that adds this entry. Each of the code commits has its own tests, and the whole suite passes after each of
+them in this order. "Before" in this entry is release `1.3.0-handgemacht.10`.
+
+A read-only test of the behaviour gate on 4 November found about 3,400 records waiting, because the plugin never sent their step to Langfuse.
+The gate finds a step by the plugin's `Tool: <name>` observation (`metadata.tool_id`) or, for a final answer, by the plugin's LLM call
+(`metadata` `agent_id`, `tool_count`, `assistant_text.orig_len`). This change keeps those keys and values as they are and makes the plugin send
+more of those steps.
+
+**What changed**
+- **Helpers under the project folder of a worktree** (`get_session_subagent_dirs`). A session that enters a worktree keeps its log in the project
+  folder it started in, but Claude Code can write the files of its helpers under the project folder of the worktree,
+  `<projects root>/<worktree folder>/<session>/subagents/`. The plugin only looked next to the log, so those helpers and their tool steps were never
+  sent. Each firing now scans the projects root once and finds every `<session>/subagents/` folder of the session, the one next to the log first.
+  The list serves the launch attribution, the parent lookup of helpers of helpers, the task id map and the Workflow run lookup. A helper with files in two
+  folders is read from the first folder that holds both its meta and its log, so every helper sent before keeps the log it was read from. One info line names the other
+  folders ("has agent files in other project folders"). A `<session>.superseded-<ms>` folder is not read. The tests now give each test, and each transcript fixture, a
+  projects root of its own (`tests/conftest.py`), since they share session names.
+- **Newer forms of a helper's notification** (`get_undelivered_queued_notification_ids`, `notification_awaits_answer`). A turn that started a helper in the background is
+  held until the helper's notification is delivered, because the answer to it belongs to the turn. The hold check knew a delivery only as a user row. Claude Code
+  2.1.31x also writes it as an attachment to the running turn, as a queue `remove` row that names its reason (`absorbed_mid_turn`, `delivered_to_agent`) and
+  as the helper's hand-back (a peer message that starts with `[Subagent hand-back]`). All of them count as delivered now. The result of a helper's own background
+  task, which the main log only queues and removes, no longer holds the main turn. A notification that arrives again after its helper handed back and the hand-back
+  was answered no longer waits for an answer it never gets. A hand-back or an attached notification after the last answer still holds the turn until the agent has answered.
+  Attachment rows only feed the hold check, so tool results and end times stay as they were.
+- **Helpers that their own background task wakes** (`get_agent_wakes_from_rows`, `emit_woken_agent_runs`). A helper was sent once, at its first stop. When a background task of its own
+  woke it afterwards, the rows it wrote after the wake formed no run and no later firing sent them. A wake is the helper's own task notification as a user row after the helper stopped
+  (its last answer had no tool call, or only `SubagentHandback`). Each wake now starts a later run, `Subagent: … (resumed #n)` like a run that `SendMessage` resumes, and the earlier
+  run ends at the wake. The main turn that holds the queued notification of the helper's next stop sends the later run, once, under its own span: the span of the launching call was
+  sent and closed with the first run.
+- **Rejected spans, smaller requests, the SDK's warnings** (`ExportWatch`, `EXPORT_BATCH_SPANS`, `PieceFlush`, `SdkLogRelay`). A batch that Langfuse took with spans rejected
+  (`partial_success.rejected_spans` in the OTLP answer, read from protobuf or JSON by hand, no new dependency) counts as `lost`, so the firing is undone and sent again like any lost
+  one; the log gets `rejected_spans` and `error_message`. The warnings and errors of the `opentelemetry` and `langfuse` loggers, such as a batch dropped above the request size limit,
+  are written to the hook log. The client sends a request for every 25 spans (about 2.5 MB at 100 KB per span; left to the SDK when `LANGFUSE_FLUSH_AT` is set), and a `Stop`
+  firing flushes after the spans of each helper that the main agent launched (nested helpers go out with their parent), capped at the 5 second flush timeout; after one flush
+  that does not finish in time, it stops flushing between helpers for that firing. A `SessionEnd` firing does not flush between helpers, since Claude Code gives it 1.5
+  seconds in total. Span contents and the metadata keys the gate reads are unchanged.
+- `FORK.md` describes them. Version raised to `1.3.0-handgemacht.11` in `.claude-plugin/plugin.json`.
+
+**Why**
+- Worktree helpers, two real sessions, counted read-only with nothing sent: launches attributed to a helper went from 38 to 70 (6101bcb5) and from 14 to 27 (6a854ffe). The added
+  helpers have their files under the project folder of a worktree.
+- Held turns: three real turns (798305be, 6101bcb5, 2e63ecf5) were held by release 10 until the next prompt, and are not held by this change.
+- Woken helpers: of the waiting records, about 48 belong to helpers that were woken. Calls sent after the whole log of three real helpers: a2dad584 16 of 55, aada18c4 17 of 27 and a0738197
+  90 of 92. Of 65 wake rows counted in the logs, 56 (41 helpers) follow an answer with no tool call and 9 follow a hand-back.
+- Lost spans: a held turn of 427 spans of about 100 KB each went out as one request of 44 MB, since the SDK sends when 512 spans are queued and the rest at the end. In the lost send a
+  block of 352 spans never arrived, and nothing in the hook log said why: the exporter drops a batch above its request size limit with a warning on its own logger, and Langfuse can take
+  a batch with spans rejected, and neither was written to the hook log.
+
+**How to tell it works**
+- Worktree helpers, offline on the two real sessions above (nothing sent, the shared Langfuse was not contacted): 38 to 70 and 14 to 27 helper launches attributed, and each helper attributed before
+  keeps the same log file. In the hook log of a running session: "session <id> has agent files in other project folders: …". In Langfuse, the number of waiting gate records of worktree
+  sessions drops.
+- Held turns, replaying the three real turns read-only, nothing sent: each is held by release 10 and not held by this change.
+- Woken helpers, replaying the three real helpers above the same way: calls sent after the whole log 55 of 55 in 4 runs (16 before), 27 of 27 (17) and 92 of 92 (90); no call sent twice. In
+  Langfuse: `Subagent: … (resumed #n)` under the span of the main turn that holds the helper's next stop.
+- Export, with the changed hook against the real SDK (4.18, OpenTelemetry 1.45) and a local collector on 127.0.0.1 with a state folder of its own: batches arrive as 25, 25, 25, 25; real protobuf
+  `partial_success` bytes are read; an oversize drop writes its warning to the hook log. For 427 spans of 100 KB: on an 8 MB/s link the SDK default sent one 42.8 MB request that hit the 5 second flush cap
+  and counted as lost, and the new setting sent 18 requests of at most 2.5 MB with a 4.1 second tail, delivered. On a 3 MB/s link both hit the cap, and the new setting got 225 of 427 spans through
+  where the old one got none. Log lines: "Langfuse answered a batch of spans with a partial success: rejected_spans=N", "[WARNING] opentelemetry…: Dropping span batch: …",
+  "flush between helpers did not finish within 5 s; the rest is sent at the end".
+- `uv run --group dev pytest`: 524 tests (Python 3.10 and 3.13), 45 of them new. Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
+  17 of the 28 export tests fail; the others guard behaviour that must stay (`tests/unit/test_subagent_discovery.py`, `tests/integration/test_helpers_of_agents.py`,
+  `tests/integration/test_notification_deliveries.py`, `tests/integration/test_woken_helpers.py`, `tests/integration/test_export_loss.py`, builders in `tests/session_files.py`,
+  `tests/held_turns.py`, `tests/woken_helpers.py` and `tests/export_helpers.py`), all with synthetic rows. `uvx ruff check --select F,E9 .` is clean, and `echo '{}' | uv run --script hooks/langfuse_hook.py`
+  with a scratch state folder exits 0.
+
+**How to undo**
+- Revert the PR's commits and update the plugin. Release 10 reads helper files next to the log only, holds a turn as before, sends a woken helper once, and its client sends at the SDK's
+  default size again. Spans already sent stay in Langfuse. The few emitted keys that woken runs leave in `langfuse_state.json` (`subagent:<agent id>@<time>`) are not read by release 10.
+
+**Known limits**
+- Sessions that were already sent are not sent again, so the waiting records of those sessions (about 48 for woken helpers) only clear when the sessions are sent again. Whether to send them
+  again is a decision for the owner; leaving them is recommended unless the gate needs those exact records.
+- Open decision, split helper runs: in 6a854ffe, 2 of 28 helpers have files in both folders, and they are not copies. Each is one run split in time: the early part (with the full meta) is in the folder of
+  the worktree, the later part (after the session left the worktree, with a shorter meta or none) in the folder of the main log, and they share no rows. The plugin reads one file per helper, so the other
+  part is still not sent. In 6101bcb5 this happens 0 times in 70. Merging a helper's logs from all folders in time order would be a larger change to how helper rows are read; keeping the rule is
+  recommended until the gate shows how many records still wait.
+- A project folder that is itself named `*.superseded-*` is not excluded; none exists in the data.
+- A remove row counts as delivered only when it names a reason. Rows without one (older Claude Code) still hold the turn, the safe direction. Upstream (langfuse/Claude-Observability-Plugin) PR 113 counts every remove row; this is a choice.
+- A hand-back is recognised by a peer message whose text starts with `[Subagent hand-back]`. If that text changes, turns are held again and the old bug is back.
+- A turn is still held in the short gap between a notification's enqueue and its remove row; in the examples the remove row came within seconds.
+- Not checked: 132 repeat notifications after a hand-back that were followed by an assistant row. It is open whether any of them was a real answer after the final answer; the named examples were never answered.
+  Worth checking against the gate's waiting records. Upstream's mapping of background-task ids to their tool calls is not part of this change.
+- A helper woken after its `SubagentHandback` call counts as woken. The change relies on the queued-notification rows that Claude Code 2.1.31x writes in the main log, and does not cover helpers of helpers that
+  their own tasks wake (the log of their parent has no such rows) nor a wake row whose text starts directly with `<task-notification>`. A woken run sits under the span of the main turn that holds the
+  helper's next stop, not under the original `Agent` call. Each firing reads again the log of each helper that has a queued notification in the open turn, a small extra cost.
+- A batch that the exporter drops above its request size limit makes no request, so the watch cannot see it: with the real SDK it still counts as `delivered` and the state is saved. It shows only as a
+  warning in the hook log. Counting that warning as a lost or refused batch is not part of this change and is for the owner to decide.
+- The 5 second flush timeout is unchanged. A very big send over a slow link still cannot finish inside it: smaller batches let more of it arrive in the background, and the next firing sends the whole turn
+  again (duplicates under the same span id, up to three tries in a row). Raising the timeout, or the SDK's own 5 second request timeout, is a separate decision.
+- The batch size 25 (`EXPORT_BATCH_SPANS`) is a pick, not measured against the real Langfuse, and the `SessionEnd` timing was checked against a local collector only, not inside Claude Code's 1.5 seconds in a real
+  session. A turn held until `SessionEnd` relies on the batch size alone, since that firing does not flush between helpers.
+- The cause of the lost block of 352 spans is not proven. This change makes such losses visible and the requests smaller, and was not shown to be the cause.
+- **Not fixed: the final answer of an idle session.** At `Stop` the hook starts sending before Claude Code 2.1.314 has written the final answer to the log (it was missing at the last firing in 11 of 11 sessions
+  looked at). It saves where it stopped reading, and the root of the turn goes out with the answer it has, and a root is sent once, so the final answer is lost when the session then goes idle. The `Stop` hook
+  runs synchronously (600 seconds), and its input has an optional `last_assistant_message` with the text of the final answer. It is not part of this change, since how the `Stop` firing should wait for the answer needs a choice between three options. Option A: wait inside the `Stop` hook for a few seconds when the answer is missing (smallest, but holds the session on most turns, and costs the full wait if
+  Claude Code writes the answer only after the hook ends). Option B, recommended: the `Stop` firing hands its work to a background process that waits about 10 seconds for the answer and then sends the turn as usual; the user
+  never waits, the locks and claims keep anything from being sent twice, and the hook falls back to today's behaviour when the process cannot start. Option C: mark the `Stop` hook async in `hooks/hooks.json` and wait inside it
+  (the user never waits, but it changes every `Stop` firing, and an async hook may be cut off when Claude Code exits). Sending again later would add the final LLM call but not the answer on the root. Not checked: whether Claude Code
+  writes the final answer while the `Stop` hook still runs or only after it ends. A failing test that shows the bug (`tests/integration/test_final_answer_at_stop.py`) is not in this PR; it waits uncommitted in the worktree
+  `hs-stop-reread` for the fix.
+- The commit hashes above are those of the pull request branch; a rebase merge gives them new hashes.
+
 ## 2026-11-02
 
 ### Helpers of helpers are sent, a moved log is not sent twice, a lost root is sent again (release 1.3.0-handgemacht.10)
