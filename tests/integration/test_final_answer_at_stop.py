@@ -10,10 +10,13 @@ from tests.final_answers import (
     claude_code_writes_the_final_answer_after,
     expect_each_step_sent_once,
     expect_final_answer_sent,
+    expect_lost_turn_sent_again,
+    expect_next_turn_sent_once,
     expect_nothing_started,
     expect_one_process_started,
     expect_turn_sent_without_final_answer,
     no_process_can_start,
+    the_next_turn_ends_while_the_waiting_process_flushes_in_vain,
     the_wait_for_the_final_answer_ends_after,
 )
 from tests.session_files import SESSION
@@ -85,6 +88,20 @@ def test_a_session_end_while_the_stop_waits_sends_the_turn_once(hook, fake_langf
 
     expect_final_answer_sent(fake_langfuse, ANSWER)
     expect_each_step_sent_once(fake_langfuse)
+
+
+def test_a_next_turn_that_ends_while_the_waiting_process_flushes_in_vain_is_sent_once(hook, fake_langfuse):
+    a_turn_without_its_final_answer(hook.transcript)
+    hook.stop(answer=ANSWER)
+    claude_code_writes_the_final_answer(hook.transcript)
+    the_next_turn_ends_while_the_waiting_process_flushes_in_vain(hook)
+
+    hook.run_the_processes_it_started()
+    hook.wait_for_the_hooks_in_background()
+    hook.session_end()
+
+    expect_next_turn_sent_once(fake_langfuse)
+    expect_lost_turn_sent_again(fake_langfuse, ANSWER)
 
 
 def test_a_session_end_before_the_final_answer_reaches_the_log_sends_the_turn_once(hook, fake_langfuse):

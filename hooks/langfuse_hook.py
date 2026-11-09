@@ -5638,8 +5638,9 @@ def emit_new_turns_from_transcript(
     flush_deferred_agent_turns: bool = False,
     payload_agent_type: Optional[str] = None,
     firing: Optional[FiringRecord] = None,
+    session_locked: bool = False,
 ) -> int:
-    with FileLock(get_session_lock_path(get_session_state_key(session_id))):
+    with contextlib.nullcontext() if session_locked else FileLock(get_session_lock_path(get_session_state_key(session_id))):
         undo_firings_stopped_before_confirmation(session_id)
         with FileLock(LOCK_FILE):
             state = load_hook_state()
@@ -6046,7 +6047,11 @@ def main() -> int:
         return 0
 
     firing = FiringRecord()
+    # Held until the firing knows whether its spans arrived, so that another firing of the session reads the
+    # state only after a lost firing has put it back, and is not undone with it.
+    session_lock = contextlib.ExitStack()
     try:
+        session_lock.enter_context(FileLock(get_session_lock_path(get_session_state_key(session_id))))
         emitted = emit_new_turns_from_transcript(
             langfuse,
             config,
@@ -6055,6 +6060,7 @@ def main() -> int:
             flush_deferred_agent_turns=flush_deferred_agent_turns,
             payload_agent_type=get_main_agent_type_from_payload(payload),
             firing=firing,
+            session_locked=True,
         )
 
         dur = time.time() - start
@@ -6078,6 +6084,7 @@ def main() -> int:
             clear_firing_note(firing)
         except Exception as e:
             debug(f"settling the firing failed: {type(e).__name__}: {e}")
+        session_lock.close()
 
 if __name__ == "__main__":
     sys.exit(main())

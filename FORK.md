@@ -128,6 +128,13 @@ Everything else works as described in the [README](./README.md).
     in the same three tries in a row. A session that is not resumed has no next
     firing, so what its stopped firing sent stays unsent. Notes older than 30
     days are removed at session end.
+  - A firing holds the session lock until it knows whether its spans arrived.
+    Another firing of the session that comes meanwhile, such as the `Stop` of a
+    short next turn while a process that waited for the final answer still
+    flushes, waits for it and goes on from the state it leaves, so a lost
+    firing's undo does not take back what a later firing sent. A firing that
+    waits longer than 2 seconds for the lock sends nothing; the next firing of
+    the session sends its turns.
   - The client sends at the SDK's own batch size and flushes once, at the end of
     the firing, so a firing usually goes out as one request (the SDK sends when
     512 spans are queued or after 5 seconds, and the rest at the flush). The undo
@@ -338,6 +345,7 @@ indexes that are older than seven days.
   the log, whose input has no `last_assistant_message`, or whose process cannot
   start sends at once, as before. A `SessionEnd` hook that runs while the
   process waits sends the turn as it finds it; the session lock, the state and
-  the root claims keep the two from sending anything twice.
+  the root claims keep the two from sending anything twice. A firing that comes
+  while the process flushes waits for it (see "Delivery").
 - The `InstructionsLoaded` and `SessionStart` hooks run in the background, so
   they never hold up Claude.
