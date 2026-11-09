@@ -1,26 +1,21 @@
 from __future__ import annotations
 
 import logging
-import shutil
-import threading
-from pathlib import Path
 
 import pytest
 
 from tests.export_helpers import (
     Answer,
+    a_langfuse_config,
     a_session_with_one_question,
-    a_session_with_three_helpers,
     a_session_with_two_helpers,
     a_span_batch,
     a_watch_of_the_exports,
-    each_flush_takes,
     expect_logged,
     expect_not_logged,
+    expect_one_flush_with_the_helpers,
+    expect_the_batch_size_of_the_sdk,
     expect_verdict,
-    flushes_before_the_end,
-    helpers_ended,
-    helpers_started,
     json_answer,
     langfuse_answers,
     langfuse_gets_a_span_batch_when_flushed,
@@ -40,13 +35,13 @@ DROPPED_BATCH = "Dropping span batch: serialized size 44040192 bytes exceeds max
     pytest.param(protobuf_answer(3, "three spans were too big"), id="protobuf"),
     pytest.param(json_answer(2, "two spans were too big"), id="json"),
 ])
-def test_a_batch_that_langfuse_took_only_in_part_counts_as_lost(hook_module, monkeypatch, answer):
+def test_a_batch_that_langfuse_took_only_in_part_counts_as_refused(hook_module, monkeypatch, answer):
     langfuse_answers(monkeypatch, [Answer(200, answer)])
     watch = a_watch_of_the_exports(hook_module)
 
     send_to_langfuse(a_span_batch())
 
-    expect_verdict(watch, "lost")
+    expect_verdict(watch, "refused")
 
 
 @pytest.mark.parametrize("answer", [
@@ -86,13 +81,13 @@ def test_a_rejected_batch_that_is_sent_again_and_taken_counts_by_its_last_try(ho
     expect_verdict(watch, "delivered")
 
 
-def test_the_log_tells_how_many_spans_langfuse_rejected_and_why(hook_module, monkeypatch):
+def test_the_log_warns_how_many_spans_langfuse_rejected_and_why(hook_module, monkeypatch):
     langfuse_answers(monkeypatch, [Answer(200, protobuf_answer(352, "span exceeds the size limit"))])
     a_watch_of_the_exports(hook_module)
 
     send_to_langfuse(a_span_batch())
 
-    expect_logged(hook_module, "rejected_spans=352", "span exceeds the size limit")
+    expect_logged(hook_module, "[WARNING]", "rejected_spans=352", "span exceeds the size limit", "not sent again")
 
 
 def test_the_log_carries_the_warning_of_an_answer_that_rejected_nothing(hook_module, monkeypatch):
@@ -104,7 +99,7 @@ def test_the_log_carries_the_warning_of_an_answer_that_rejected_nothing(hook_mod
     expect_logged(hook_module, "rejected_spans=0", "a span was changed")
 
 
-def test_a_firing_whose_spans_langfuse_rejected_in_part_is_sent_again_by_the_next_firing(
+def test_a_firing_whose_spans_langfuse_rejected_in_part_is_not_sent_again_by_the_next_firing(
     hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
 ):
     session = a_session_with_one_question(tmp_path)
@@ -114,7 +109,7 @@ def test_a_firing_whose_spans_langfuse_rejected_in_part_is_sent_again_by_the_nex
     run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch)
     run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch)
 
-    assert turns_sent(fake_langfuse) == 2
+    assert turns_sent(fake_langfuse) == 1
 
 
 def test_warnings_of_the_opentelemetry_exporter_reach_the_plugin_log(hook_module):
@@ -171,126 +166,20 @@ def test_a_firing_logs_what_the_exporter_warns_while_it_flushes(
     expect_logged(hook_module, DROPPED_BATCH)
 
 
-def test_the_client_is_made_to_send_smaller_batches_than_the_sdk_default(hook_module):
-    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", None)
+def test_the_client_sends_at_the_batch_size_of_the_sdk(hook_module):
+    config = a_langfuse_config(hook_module)
 
     client = hook_module.create_langfuse_client(config)
 
-    assert client.kwargs["flush_at"] == hook_module.EXPORT_BATCH_SPANS
-    assert 0 < hook_module.EXPORT_BATCH_SPANS < 512
+    expect_the_batch_size_of_the_sdk(client)
 
 
-def test_a_batch_size_that_the_operator_set_is_left_to_the_sdk(hook_module, monkeypatch):
-    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", None)
-    monkeypatch.setenv("LANGFUSE_FLUSH_AT", "100")
-
-    client = hook_module.create_langfuse_client(config)
-
-    assert client.kwargs["flush_at"] is None
-
-
-def test_a_stop_firing_flushes_after_each_helper_before_the_next_one_is_read(
-    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
+@pytest.mark.parametrize("event", ["Stop", "SessionEnd"])
+def test_a_firing_sends_all_its_helpers_in_one_flush_at_its_end(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch, event
 ):
     session = a_session_with_two_helpers(tmp_path)
 
-    run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch, event="Stop")
+    run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch, event=event)
 
-    after_first, after_second = flushes_before_the_end(fake_langfuse)
-    assert helpers_started(after_first) == helpers_ended(after_first) == ["Subagent: checker · First"]
-    assert helpers_ended(after_second) == ["Subagent: checker · First", "Subagent: checker · Second"]
-
-
-def test_a_session_end_firing_does_not_flush_between_helpers(
-    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
-):
-    session = a_session_with_two_helpers(tmp_path)
-
-    run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch, event="SessionEnd")
-
-    assert flushes_before_the_end(fake_langfuse) == []
-    assert len(fake_langfuse.flushes) == 1
-
-
-def test_helpers_inside_a_helper_go_out_with_it(
-    hook_module, fake_langfuse, isolated_hook_state, fixture_transcript_path, tmp_path, monkeypatch
-):
-    transcript = a_copy_of_the_three_level_session(fixture_transcript_path, tmp_path)
-    hook_module.PIECE_FLUSH.enabled = True
-
-    an_emission_of(hook_module, fake_langfuse, transcript)
-
-    [after_the_helper_and_its_helpers] = fake_langfuse.flushes
-    assert len(helpers_ended(after_the_helper_and_its_helpers)) == 3
-
-
-def test_flushing_between_helpers_stops_after_a_flush_that_does_not_finish_in_time(
-    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
-):
-    session = a_session_with_two_helpers(tmp_path)
-    monkeypatch.setattr(hook_module, "FLUSH_TIMEOUT_SECONDS", 0.05)
-    release = threading.Event()
-    fake_langfuse.on_flush = lambda: release.wait(2)
-
-    try:
-        run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch, event="Stop")
-    finally:
-        release.set()
-
-    assert len(flushes_before_the_end(fake_langfuse)) == 1
-    expect_logged(hook_module, "did not finish")
-
-
-def test_flushing_between_helpers_stops_after_a_flush_whose_batch_did_not_reach_langfuse(
-    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
-):
-    session = a_session_with_two_helpers(tmp_path)
-    langfuse_answers(monkeypatch, [Answer(503), Answer(200), Answer(200)])
-    langfuse_gets_a_span_batch_when_flushed(fake_langfuse)
-
-    run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch, event="Stop")
-
-    assert len(flushes_before_the_end(fake_langfuse)) == 1
-    expect_logged(hook_module, "did not reach Langfuse")
-
-
-def test_the_flushes_between_helpers_share_one_flush_timeout(
-    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
-):
-    session = a_session_with_three_helpers(tmp_path)
-    monkeypatch.setattr(hook_module, "FLUSH_TIMEOUT_SECONDS", 0.25)
-    each_flush_takes(fake_langfuse, 0.15)
-
-    run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch, event="Stop")
-
-    assert len(flushes_before_the_end(fake_langfuse)) == 2
-    expect_logged(hook_module, "did not finish")
-
-
-def test_a_flush_between_helpers_that_fails_does_not_stop_the_firing(
-    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
-):
-    session = a_session_with_two_helpers(tmp_path)
-
-    def fail() -> None:
-        raise RuntimeError("the SDK refused")
-
-    fake_langfuse.on_flush = fail
-
-    run_a_firing_in_a_new_process(hook_module, fake_langfuse, session, monkeypatch, event="Stop")
-
-    assert turns_sent(fake_langfuse) == 1
-    assert len(flushes_before_the_end(fake_langfuse)) == 2
-
-
-def a_copy_of_the_three_level_session(fixture_transcript_path, tmp_path: Path) -> Path:
-    source = fixture_transcript_path("nested_agents_three_levels")
-    shutil.copytree(source.parent, tmp_path / "three_levels")
-    return tmp_path / "three_levels" / "transcript.jsonl"
-
-
-def an_emission_of(hook_module, fake_langfuse, transcript: Path) -> None:
-    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
-    hook_module.emit_new_turns_from_transcript(
-        fake_langfuse, config, "session-deep", transcript, flush_deferred_agent_turns=True
-    )
+    expect_one_flush_with_the_helpers(fake_langfuse, "Subagent: checker · First", "Subagent: checker · Second")

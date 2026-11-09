@@ -356,6 +356,14 @@ def info(msg: str) -> None:
         except Exception:
             pass
 
+def warning(msg: str) -> None:
+    lg = _get_logger()
+    if lg is not None:
+        try:
+            lg.warning(msg)
+        except Exception:
+            pass
+
 
 # The OpenTelemetry exporter and the Langfuse SDK report what they drop or fail to
 # send on their own loggers, which nothing reads in a hook; the plugin log gets
@@ -422,10 +430,6 @@ def read_plugin_version() -> Optional[str]:
         return None
 
 
-# The SDK sends a request when 512 spans are queued, and the rest at the end, so a held turn
-# of 427 spans of about 100 KB each went out as one request of 44 MB. 25 spans are about 2.5 MB.
-EXPORT_BATCH_SPANS = 25
-
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
     # With capture off, stop the SDK from uploading base64 images it finds
     # in span payloads on its own. The SDK reads an empty value as enabled.
@@ -437,7 +441,6 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
             secret_key=config.secret_key,
             host=config.host,
             release=read_plugin_version(),
-            flush_at=None if os.environ.get("LANGFUSE_FLUSH_AT") else EXPORT_BATCH_SPANS,
         )
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
@@ -4763,8 +4766,6 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             _get_latest_timestamp(latest_end_timestamp, subagent_start_timestamp)
         )
     )
-    if nesting.depth == 0:
-        PIECE_FLUSH.after_piece(langfuse)
 
     return latest_end_timestamp
 
@@ -5744,7 +5745,7 @@ def emit_new_turns_from_transcript(
             session_context=session_context,
         )
 
-        # Progress is persisted before the final SDK flush in main(), so a dropped
+        # Progress is persisted before the SDK flush in main(), so a dropped
         # flush leaves emitted_keys pointing at spans that never reached the
         # server. main() puts the state back when it sees the delivery fail;
         # the note left here lets the next firing do the same when this
@@ -5765,9 +5766,10 @@ def emit_new_turns_from_transcript(
 
 FLUSH_TIMEOUT_SECONDS = 5.0
 
-# What became of the spans a process sent. "lost": a batch failed, did not
-# finish or had spans that Langfuse rejected, so sending it again can work. "refused": Langfuse answered with an
-# error that sending again does not change (a wrong key, a batch that is too big).
+# What became of the spans a process sent. "lost": a batch failed or did not
+# finish, so sending it again can work. "refused": Langfuse answered with an
+# error that sending again does not change (a wrong key, a batch that is too big),
+# or took a batch with spans rejected, where sending it again would send the taken spans twice.
 DELIVERED = "delivered"
 LOST = "lost"
 REFUSED = "refused"
@@ -5787,10 +5789,10 @@ class ExportWatch:
 
     def record(self, body: Any, status_code: Optional[int], rejected_spans: int = 0) -> None:
         """status_code is None when the batch got no answer. A batch of which Langfuse
-        rejected spans, though it answered with a success, counts as lost."""
+        rejected spans, though it answered with a success, counts as refused."""
         key = hashlib.sha256(body).digest() if isinstance(body, (bytes, bytearray)) else len(self.last_try)
         if status_code is not None and status_code < 400:
-            self.last_try[key] = LOST if rejected_spans > 0 else DELIVERED
+            self.last_try[key] = REFUSED if rejected_spans > 0 else DELIVERED
         elif status_code is None or status_code >= 500 or status_code in RETRYABLE_STATUS_CODES:
             self.last_try[key] = LOST
         else:
@@ -5881,7 +5883,11 @@ def install_export_watch(watch: ExportWatch = EXPORT_WATCH) -> bool:
             rejected_spans = 0
             if status is not None and status < 400 and not kwargs.get("stream"):
                 rejected_spans, error_message = read_partial_success(getattr(response, "content", None))
-                if rejected_spans or error_message:
+                if rejected_spans:
+                    warning(f"Langfuse answered a batch of spans with a partial success: "
+                            f"rejected_spans={rejected_spans} error_message={error_message!r}; "
+                            f"the rejected spans are lost and the batch is not sent again")
+                elif error_message:
                     info(f"Langfuse answered a batch of spans with a partial success: "
                          f"rejected_spans={rejected_spans} error_message={error_message!r}")
             watch.record(getattr(request, "body", None), status, rejected_spans)
@@ -5891,51 +5897,11 @@ def install_export_watch(watch: ExportWatch = EXPORT_WATCH) -> bool:
     requests.Session.send = watched_send  # type: ignore[method-assign]
     return True
 
-class PieceFlush:
-    """Sends the spans of a finished piece of a big send, one helper's run, before the next piece is read.
-
-    The SDK sends a batch as soon as EXPORT_BATCH_SPANS spans are queued, so a piece of
-    a few hundred spans goes out in several requests; the flush gives each piece a request
-    of its own at its end. It is off in a SessionEnd firing: Claude Code stops that hook
-    after 1.5 seconds in total, and the wait would use that time before the progress is
-    saved. The flushes between pieces get FLUSH_TIMEOUT_SECONDS in total, and a flush whose
-    batch did not reach Langfuse ends them too: with Langfuse down each flush takes about
-    3 seconds, for every helper of the firing. The flush at the end of the firing tells
-    what did not arrive."""
-
-    def __init__(self) -> None:
-        self.enabled = False
-        self.given_up = False
-        self.spent = 0.0
-
-    def after_piece(self, langfuse: Any) -> None:
-        if not self.enabled or self.given_up:
-            return
-
-        def _flush() -> None:
-            with contextlib.suppress(Exception):
-                langfuse.flush()
-
-        started = time.monotonic()
-        thread = threading.Thread(target=_flush, daemon=True)
-        thread.start()
-        thread.join(FLUSH_TIMEOUT_SECONDS - self.spent)
-        self.spent += time.monotonic() - started
-        if thread.is_alive():
-            self.given_up = True
-            info(f"flushes between helpers did not finish within {FLUSH_TIMEOUT_SECONDS:g} s in total; "
-                 f"the rest is sent at the end")
-        elif EXPORT_WATCH.verdict() != DELIVERED:
-            self.given_up = True
-            info("a flush between helpers did not reach Langfuse; the rest is sent at the end")
-
-PIECE_FLUSH = PieceFlush()
-
 def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> str:
     """Flush and shut down the client, waiting at most FLUSH_TIMEOUT_SECONDS.
 
     Returns DELIVERED, or LOST when the flush did not finish in time or a batch
-    failed or had spans rejected on its last try, or REFUSED when Langfuse refused a batch."""
+    failed on its last try, or REFUSED when Langfuse refused a batch or rejected spans of one."""
     if langfuse is None:
         return DELIVERED
 
@@ -5990,7 +5956,6 @@ def main() -> int:
 
     route_sdk_warnings_to_log()
     install_export_watch()
-    PIECE_FLUSH.enabled = not flush_deferred_agent_turns
     langfuse = create_langfuse_client(config)
     if langfuse is None:
         return 0

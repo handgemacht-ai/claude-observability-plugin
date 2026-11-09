@@ -309,9 +309,6 @@ def _isolated_hook_env(tmp_path: Path, hook_module: Any, monkeypatch: pytest.Mon
     hook_module._AGENT_DEFINITION_CACHE.clear()
     hook_module.SENT_ROOT_CLAIMS.clear()
     hook_module.EXPORT_WATCH.last_try.clear()
-    hook_module.PIECE_FLUSH.enabled = False
-    hook_module.PIECE_FLUSH.given_up = False
-    hook_module.PIECE_FLUSH.spent = 0.0
     _reset_hook_logger(hook_module)
     yield state_dir
     _reset_hook_logger(hook_module)

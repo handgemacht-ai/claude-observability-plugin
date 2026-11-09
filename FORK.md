@@ -106,14 +106,15 @@ Everything else works as described in the [README](./README.md).
 - **Delivery**: the SDK's flush returns nothing and swallows errors, so the hook
   watches `requests.Session.send`, which the OTLP exporter uses for every span
   batch. After the flush, the spans are `delivered`; `lost` when a batch got no
-  answer or a 5xx, 408, 425 or 429 on its last try, when Langfuse answered with a
-  success but rejected spans of the batch (`partial_success.rejected_spans` in the
-  OTLP answer, read from protobuf or JSON), or the flush did not finish in
+  answer or a 5xx, 408, 425 or 429 on its last try, or the flush did not finish in
   5 seconds; `refused` for any other error status (a wrong key, a batch that is
-  too big). A refused or lost firing gives its root claims back. A lost firing
+  too big), and when Langfuse answered with a success but rejected spans of the
+  batch (`partial_success.rejected_spans` in the OTLP answer, read from protobuf or
+  JSON). A refused or lost firing gives its root claims back. A lost firing
   also puts its session state back as it was, so the next firing reads the same
   rows and sends the same turns again, up to three times in a row; refused
-  batches are not sent again, because the answer would be the same. A span has
+  batches are not sent again, because the answer would be the same, or the spans
+  that Langfuse took of a batch with rejected spans would arrive twice. A span has
   the same id each time it is sent, so one that arrived after all appears twice
   under one id.
   - A firing saves its progress before its last flush, and Claude Code stops a
@@ -127,23 +128,22 @@ Everything else works as described in the [README](./README.md).
     in the same three tries in a row. A session that is not resumed has no next
     firing, so what its stopped firing sent stays unsent. Notes older than 30
     days are removed at session end.
-  - The client sends a request for every 25 spans (`EXPORT_BATCH_SPANS`; the
-    SDK waits for 512 and sends the rest at the end, so a held turn of 427 spans
-    of about 100 KB each went out as one request of 44 MB), unless the operator set
-    `LANGFUSE_FLUSH_AT`. In a `Stop` firing, the spans of each helper that the
-    main agent launched are flushed when the hook has handed them to the SDK
-    (nested helpers go out with their parent), so a big turn goes out helper by
-    helper. These flushes get 5 seconds in total, and a flush whose batch did
-    not reach Langfuse ends them too, so a slow or unreachable Langfuse does not
-    cost seconds per helper; the flush at the end tells what did not arrive. A `SessionEnd`
-    firing does not flush between helpers, since it has 1.5 seconds in total.
+  - The client sends at the SDK's own batch size and flushes once, at the end of
+    the firing, so a firing usually goes out as one request (the SDK sends when
+    512 spans are queued or after 5 seconds, and the rest at the flush). The undo
+    covers the whole firing, so a firing sent as many small requests would send
+    again the ones that had arrived when one of them was lost; for that reason the
+    fork does not send in smaller batches.
   - The warnings and errors of the `opentelemetry` and `langfuse` loggers go to
     the hook log (`langfuse_hook.log` in the state folder), for example "Dropping
-    span batch" for a batch above the exporter's request size limit, and a line
+    span batch" for a batch above the exporter's request size limit, and a warning
     "Langfuse answered a batch of spans with a partial success" with the number
     of rejected spans and the message. A batch that the exporter drops before it
     sends makes no request, so the watch counts it as `delivered`; only the
-    warning shows it.
+    warning shows it. Why a big send once lost a block of 352 of its 427 spans
+    without a line in the hook log is not known; the two causes the hook can see,
+    a batch dropped above the size limit and spans that Langfuse rejected, now
+    show in its log.
 - **Predictable span ids**: a program that knows a trace can compute the span
   id of the root, of every LLM call and of every tool step (edits included)
   without asking Langfuse, for example to nest its own runs under a step.

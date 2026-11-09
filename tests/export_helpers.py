@@ -5,7 +5,6 @@ import io
 import json
 import logging
 import sys
-import time
 import types
 from pathlib import Path
 from typing import Any
@@ -126,23 +125,6 @@ def a_session_with_two_helpers(tmp_path: Path) -> SessionDir:
     return session
 
 
-def a_session_with_three_helpers(tmp_path: Path) -> SessionDir:
-    session = a_session_with_two_helpers(tmp_path)
-    session.write_main([
-        user("u1", 0, "Check all three."),
-        assistant("a1", 1, [tool_use(f"toolu_{agent_id}", "Agent", description=agent_id.title(), subagent_type="checker")
-                            for agent_id in ("first", "second", "third")]),
-        tool_result("r1", 50, "toolu_first", "First done.", agentId="first"),
-        tool_result("r2", 51, "toolu_second", "Second done.", agentId="second"),
-        tool_result("r3", 52, "toolu_third", "Third done.", agentId="third"),
-        assistant("a2", 53, [{"type": "text", "text": "Done."}]),
-    ])
-    session.add_agent("third", [user("third-prompt", 2, "Third task."),
-                                assistant("third-answer", 3, [{"type": "text", "text": "Done."}])],
-                      {"agentType": "checker", "description": "Third", "toolUseId": "toolu_third", "spawnDepth": 1})
-    return session
-
-
 def run_a_firing_in_a_new_process(hook_module: Any, fake_langfuse: Any, session: SessionDir,
                                   monkeypatch: pytest.MonkeyPatch, event: str = "Stop") -> None:
     """Runs main() as Claude Code does for the hook event, with the exports of an earlier process forgotten."""
@@ -159,22 +141,19 @@ def langfuse_gets_a_span_batch_when_flushed(fake_langfuse: Any) -> None:
     fake_langfuse.on_flush = lambda: send_to_langfuse(a_span_batch())
 
 
-def each_flush_takes(fake_langfuse: Any, seconds: float) -> None:
-    fake_langfuse.on_flush = lambda: time.sleep(seconds)
-
-
 def turns_sent(fake_langfuse: Any) -> int:
     return len([o for o in fake_langfuse.observations if o.name == "Conversational Turn"])
 
 
-def flushes_before_the_end(fake_langfuse: Any) -> list[list[tuple[str, bool]]]:
-    """What was started and ended at each flush that came before the flush at the end of the firing."""
-    return fake_langfuse.flushes[:-1]
+def a_langfuse_config(hook_module: Any) -> Any:
+    return hook_module.LangfuseConfig("public", "secret", "https://example.test", None)
 
 
-def helpers_ended(flush: list[tuple[str, bool]]) -> list[str]:
-    return [name for name, ended in flush if name.startswith("Subagent:") and ended]
+def expect_the_batch_size_of_the_sdk(client: Any) -> None:
+    assert "flush_at" not in client.kwargs, client.kwargs
 
 
-def helpers_started(flush: list[tuple[str, bool]]) -> list[str]:
-    return [name for name, _ended in flush if name.startswith("Subagent:")]
+def expect_one_flush_with_the_helpers(fake_langfuse: Any, *helpers: str) -> None:
+    """The firing flushed once, at its end, with every helper's span ended by then."""
+    [the_flush] = fake_langfuse.flushes
+    assert [name for name, ended in the_flush if name.startswith("Subagent:") and ended] == list(helpers)
