@@ -12,7 +12,7 @@ read without changing them. "Before" is release `1.3.0-handgemacht.8`, "after" i
 
 ## 2026-11-09
 
-### Helper steps reach Langfuse: helpers under a worktree's folder, turns held for finished helpers, woken helpers, rejected spans (release 1.3.0-handgemacht.11)
+### Helper steps reach Langfuse: helpers under a worktree's folder, turns held for finished helpers, woken helpers, rejected spans, the final answer at Stop (release 1.3.0-handgemacht.11)
 
 [PR #NN](https://github.com/handgemacht-ai/claude-observability-plugin/pull/NN), on top of PR #11. Commits in landing order:
 `a02fa72` (helpers under the project folder of a worktree), `4f5886a` (newer forms of a helper's notification), `beb3b25` (helpers that
@@ -21,8 +21,8 @@ their own background task wakes), `03594c5` (rejected spans, smaller requests, t
 them in this order. Review fixes on top: `f1ff7c8` (a project folder the user cannot search), `b5fadd8` (journal results of a Workflow run split over two folders),
 `6eada7d` (tests of the notification guards), `beb3398` (a hand-back with a note before its marker), `f9034dd` (woken runs cut only at queued stops, helpers of helpers
 not cut), `300232b` (a woken run sent once), `e4cb416` (test of a `SendMessage` run after a woken run), `e2b83f5` (one flush budget between helpers), `0d7c9db` (replies to
-repeat notifications), `c122695` (the list of these fixes) and the commit that goes back to one request per firing and counts rejected spans as refused; the whole suite
-passes after the last of them. "Before" in this entry is release `1.3.0-handgemacht.10`.
+repeat notifications), `c122695` (the list of these fixes), `5c6b075` (back to one request per firing, rejected spans count as refused) and the commit that makes a `Stop` firing
+wait for its final answer; the whole suite passes after the last of them. "Before" in this entry is release `1.3.0-handgemacht.10`.
 
 A read-only test of the behaviour gate on 4 November found about 3,400 records waiting, because the plugin never sent their step to Langfuse.
 The gate finds a step by the plugin's `Tool: <name>` observation (`metadata.tool_id`) or, for a final answer, by the plugin's LLM call
@@ -63,6 +63,14 @@ more of those steps.
   firing was lost (a 500, 408 or 425, which the exporter does not retry, or no answer after its retries), or the firing was stopped during the early flushes, the next firing sent again
   the requests that had arrived. The main session decided on the user's behalf, as the safe default, to go back to one request per firing and to count a partial success as refused,
   not lost, for the same reason. A request with no answer, a 5xx or a flush that did not finish still counts as lost and is undone.
+- **The final answer at `Stop`** (`final_answer_is_missing_from_log`, `start_firing_that_waits_for_final_answer`, `wait_for_final_answer`). Claude Code 2.1.31x runs the `Stop` hook
+  before it has written the turn's final answer to the log; the rows land 0.3 to 3 seconds later (missing at the last firing in 11 of 11 sessions looked at). The hook sent the turn's
+  root at once with the answer it had, and a root is sent once, so the root kept the wrong answer, and in a session that then went idle the final LLM call was never sent. When the
+  `last_assistant_message` of the `Stop` input is not yet the text of the last assistant message in the log (whitespace aside), the `Stop` hook now starts the same hook as a detached
+  process with `--wait-for-final-answer` and the same input, and ends at once. That process waits at most 10 seconds for the answer and then runs the firing the `Stop` would have run.
+  A `Stop` whose answer is in the log, or whose input has no `last_assistant_message`, fires at once as before, and so does one whose process cannot start. There is still one firing
+  per `Stop`, so the session lock, the state and the root claims keep it apart from a `SessionEnd` or a later `Stop` of the session, as for any two firings. The user was shown three
+  ways and did not choose; the main session chose this one as the default, since it neither holds up the session nor changes a `Stop` that has its answer.
 - `FORK.md` describes them. Version raised to `1.3.0-handgemacht.11` in `.claude-plugin/plugin.json`.
 
 **Why**
@@ -89,18 +97,25 @@ more of those steps.
   oversize drop writes its warning to the hook log. The SDK's batch size, which this entry goes back to, sent 427 spans of 100 KB as one 42.8 MB request that hit the 5 second flush cap on an
   8 MB/s link and counted as lost. Not run again against the collector after the change back. Log lines: "[WARNING] Langfuse answered a batch of spans with a partial success:
   rejected_spans=N error_message='…'; the rejected spans are lost and the batch is not sent again", "[WARNING] opentelemetry…: Dropping span batch: …".
-- `uv run --group dev pytest`: 531 tests, 52 of them new (524 before the review fixes, run on Python 3.10 and 3.13; the review fixes were run on 3.13 only). Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
+- The final answer at `Stop`, one real `Stop` hook run through `uv run --script` on a synthetic session (scratch home and state folder, Langfuse set to a closed port on 127.0.0.1):
+  the hook ended after 0.49 seconds, its process waited until the answer was written 1.5 seconds after the start, then fired, and no process was left. Log lines: "the final answer of
+  session <id> is not in the log yet; a process of its own waits for it and sends the turn", and after a wait in vain "the final answer did not reach the log within 10 s; sending the
+  turn without it". In Langfuse, the root of the last turn of an idle session shows the final answer.
+- `uv run --group dev pytest`: 538 tests, 59 of them new (524 before the review fixes, run on Python 3.10 and 3.13; the review fixes were run on 3.13 only). Before the fix 5 of the 7 worktree tests, 4 of the 7 notification tests, all 3 woken-helper tests and
   11 of the 24 export tests fail; the others guard behaviour that must stay (`tests/unit/test_subagent_discovery.py`, `tests/integration/test_helpers_of_agents.py`,
-  `tests/integration/test_notification_deliveries.py`, `tests/integration/test_woken_helpers.py`, `tests/integration/test_export_loss.py`, builders in `tests/session_files.py`,
-  `tests/held_turns.py`, `tests/woken_helpers.py` and `tests/export_helpers.py`), all with synthetic rows. `uvx ruff check --select F,E9 .` is clean, and `echo '{}' | uv run --script hooks/langfuse_hook.py`
+  `tests/integration/test_notification_deliveries.py`, `tests/integration/test_woken_helpers.py`, `tests/integration/test_export_loss.py`,
+  `tests/integration/test_final_answer_at_stop.py`, builders in `tests/session_files.py`, `tests/held_turns.py`, `tests/woken_helpers.py`, `tests/export_helpers.py` and
+  `tests/final_answers.py`), all with synthetic rows. `uvx ruff check --select F,E9 .` is clean, and `echo '{}' | uv run --script hooks/langfuse_hook.py`
   with a scratch state folder exits 0.
 - Review fixes: each of the 7 tests that come with a fix fails before it (the 2 of `e2b83f5` went with the flushes between helpers), and so do 6 of the export tests that the change back to one
   request per firing changes or adds; the `SessionEnd` case of its flush test passes before and after. The 4 guard tests (a remove row without a reason, `delivered_to_agent`, a hand-back next to another helper's queued
   notification, a `SendMessage` run after a woken run) pass before and fail only under the change they pin.
+- The final answer at `Stop`: 3 of its 7 tests fail before the fix (the answer written after the `Stop`, a wait in vain, a `SessionEnd` after the answer while the process waits); the
+  other 4 (answer already in the log, no `last_assistant_message`, no process can start, a `SessionEnd` before the answer) pass before and after.
 
 **How to undo**
-- Revert the PR's commits and update the plugin. Release 10 reads helper files next to the log only, holds a turn as before, sends a woken helper once, and does not read
-  `partial_success` or the SDK's loggers. Spans already sent stay in Langfuse. The few emitted keys that woken runs leave in `langfuse_state.json` (`subagent:<agent id>@<time>`) are not read by release 10.
+- Revert the PR's commits and update the plugin. Release 10 reads helper files next to the log only, holds a turn as before, sends a woken helper once, does not read
+  `partial_success` or the SDK's loggers, and sends a turn at its `Stop` without waiting for the final answer. Spans already sent stay in Langfuse. The few emitted keys that woken runs leave in `langfuse_state.json` (`subagent:<agent id>@<time>`) are not read by release 10.
 
 **Known limits**
 - Sessions that were already sent are not sent again, so the waiting records of those sessions (about 48 for woken helpers) only clear when the sessions are sent again. Whether to send them
@@ -132,14 +147,11 @@ more of those steps.
   turn again (duplicates under the same span id, up to three tries in a row). Raising the timeout, or the SDK's own 5 second request timeout, is a separate decision.
 - The cause of the lost block of 352 spans is still open. This change makes such a loss visible in the hook log (a batch dropped above the size limit, spans that Langfuse rejected) and does not
   prevent it.
-- **Not fixed: the final answer of an idle session.** At `Stop` the hook starts sending before Claude Code 2.1.314 has written the final answer to the log (it was missing at the last firing in 11 of 11 sessions
-  looked at). It saves where it stopped reading, and the root of the turn goes out with the answer it has, and a root is sent once, so the final answer is lost when the session then goes idle. The `Stop` hook
-  runs synchronously (600 seconds), and its input has an optional `last_assistant_message` with the text of the final answer. It is not part of this change, since how the `Stop` firing should wait for the answer needs a choice between three options. Option A: wait inside the `Stop` hook for a few seconds when the answer is missing (smallest, but holds the session on most turns, and costs the full wait if
-  Claude Code writes the answer only after the hook ends). Option B, recommended: the `Stop` firing hands its work to a background process that waits about 10 seconds for the answer and then sends the turn as usual; the user
-  never waits, the locks and claims keep anything from being sent twice, and the hook falls back to today's behaviour when the process cannot start. Option C: mark the `Stop` hook async in `hooks/hooks.json` and wait inside it
-  (the user never waits, but it changes every `Stop` firing, and an async hook may be cut off when Claude Code exits). Sending again later would add the final LLM call but not the answer on the root. Not checked: whether Claude Code
-  writes the final answer while the `Stop` hook still runs or only after it ends. A failing test that shows the bug (`tests/integration/test_final_answer_at_stop.py`) is not in this PR; it waits uncommitted in the worktree
-  `hs-stop-reread` for the fix.
+- The final answer at `Stop`: an answer that reaches the log more than 10 seconds after the `Stop`, or whose text in the log differs from `last_assistant_message` in more than whitespace,
+  is sent after the wait as before, without it on the root. The check reads the last 256 KB of the log (and twice the answer's size), so an answer followed by more rows than that is waited
+  for in vain, and a turn without a reply row of its own yet whose answer equals the one before counts as written. A `SessionEnd` that runs before the answer lands sends the turn without it,
+  as before, since it has 1.5 seconds in total. The waiting process is not tracked: when it is stopped while it waits, the next firing of the session sends the turn. Not run on Windows, where
+  the process starts with `DETACHED_PROCESS` and no console, nor checked on real sessions beyond the one run above with a synthetic log.
 - The commit hashes above are those of the pull request branch; a rebase merge gives them new hashes.
 
 ## 2026-11-02
