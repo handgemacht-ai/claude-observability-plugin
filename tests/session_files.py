@@ -295,6 +295,26 @@ def answered_at_the_helper_next_stop(rows: list[dict[str, Any]]) -> list[dict[st
                    answer("b2", 67, "The helper checked b.")]
 
 
+HELPER_RESUME_CALL = "toolu_helper_resume"
+HELPER_RESUMED_CALL = "toolu_helper_read_resumed"
+
+
+def resumed_by_send_message(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return rows + [user("h-resume", 45, "Check c too.", isMeta=True, origin={"kind": "coordinator"}),
+                   assistant("h-a11", 46, [tool_use(HELPER_RESUMED_CALL, "Read", file_path="c.txt")]),
+                   tool_result("h-r6", 47, HELPER_RESUMED_CALL, "C."),
+                   answer("h-a12", 50, "C is fine.")]
+
+
+def a_turn_that_resumed_the_helper_and_was_answered_at_its_stop(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    note = notification_text(tool_use_id=HELPER_RESUME_CALL)
+    return rows + [user("u3", 43, "Ask the helper about c."),
+                   assistant("c1", 44, [tool_use(HELPER_RESUME_CALL, "SendMessage", to=HELPER_TASK, message="Check c.")]),
+                   tool_result("c-r1", 44.5, HELPER_RESUME_CALL, "Resumed.", resumedAgentId=HELPER_TASK),
+                   answer("c2", 44.8, "The helper checks c."),
+                   queued(56, note), delivered("n4", 56.1, note), answer("c3", 57, "C is fine.")]
+
+
 INNER_TASK = "inner"
 INNER_BACKGROUND_CALL = "toolu_inner_bash"
 INNER_LATER_CALL = "toolu_inner_read"
